@@ -104,4 +104,16 @@ checked; FEATURES.md has the status of everything).
   `host/frame_test.ps1` (dev client only) measures non-opaque block pixels while spinning; to be run when the games
   are closed.
 
+**2026-10-11 late, master-spec round (measured, dev client).**
+- **Fade:** the fade-in theory was corrected. terrain.fsh mixes toward the fog colour (black here) beyond
+  chunkFullyVisibleRange; it never touches alpha (0.00% non-opaque in 736 frames, fade on or off). The fix stays and
+  removes black flashes on distant blocks.
+- **Torn slots:** found by measurement, 4 of 259 reads torn. Fixed with a reader slot at header +48: the compositor
+  maps the header read/write (InterlockedExchange), and FrameExporter skips that slot. After: 0 of 257. The compositor
+  also validates the header, dimensions and pose.
+- **Poses:** `mv` bits from GTA (IS_PED_SPRINTING, GET_PED_STEALTH_MOVEMENT / IS_PED_DUCKING, IS_PED_SWIMMING(_UNDER_WATER),
+  IS_PED_SITTING_IN_ANY_VEHICLE, IS_PED_CLIMBING) are applied in AvatarRendererMixin as isCrouching, swimAmount (eased)
+  and isPassenger. Frames checked: standing, crouching, swimming and seated all render as one whole model.
+- **Updater:** backup, verify and rollback, plus a log. The rollback was tested with -SimulateFailure.
+
 **Installed:** `install.ps1 -Edition Enhanced`. The files it replaced are in `gta/build/game_backup_20261010/`.

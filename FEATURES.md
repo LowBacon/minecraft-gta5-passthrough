@@ -27,7 +27,7 @@ says how each row was checked:
 | Minecraft lighting vs GTA's time | Synchronized | render.alwaysDaylight: Minecraft lights its blocks as at noon, and GTA's light is applied by the effect, so a night doesn't darken them twice. Minecraft's real time is unchanged. | built |
 | Distant blocks flashing dark / dropping out while the camera turns | Synchronized (fixed) | Minecraft 26.3 fades a chunk section in over `chunkSectionFadeInTime` (0.75 s). `terrain.fsh` mixes its colour toward the fog colour, which is black in the passthrough, for sections beyond `chunkFullyVisibleRange`. The fade restarts whenever the section comes back into the visibility graph (`SectionOcclusionGraph.runUpdates`) and on every rebuild (`setSectionMesh`). Here that's all the time: GTA's camera swings, and the host's ground keeps rebuilding the sections round the player. `LevelRendererMixin` sets the fade to 0 while attached; the option itself is untouched. `host/frame_test.ps1` measured that it never affects alpha or coverage: 0.00% non-opaque in 479 frames, even with the fade on. | built (in-game pending) |
 | Slightly see-through blocks | Synchronized (fixed) | The shader's haze faded far blocks toward the blurred GTA picture *behind* them. Edge softening at 1.0 blended edge pixels half into GTA. Now the haze goes toward GTA's average air colour from 40 m, and edge softening is 0.35. | in game (shader live) |
-| Torn frames from the shared memory | Synchronized (fixed) | Measured: 1.5–1.8% of reads overlapped Minecraft rewriting the same slot. These are the stair-step tears. GTA refuses them now (double buffering). Minecraft also never rewrites the slot the host is reading: the host's read slot is in header +48. | dev client |
+| Torn frames from the shared memory | Synchronized (fixed) | Measured: 4 of 259 reads (1.5%) overlapped Minecraft rewriting the same slot. These are the stair-step tears. Now the reader names the slot it's copying (header +48) and Minecraft skips that slot: 0 of 257 under the same load. GTA also refuses any torn frame (double buffering), and checks the header, dimensions and pose before reading, so a bad frame can never read past the mapping. | dev client |
 | Empty edge while turning | Synchronized | `render.overscan` (1.12): Minecraft renders a wider view than GTA's (third person) and exports the real fov, so turning re-projects into picture that's there. | built |
 | Minecraft's pixel art | Synchronized | "Crisp Minecraft pixels": each texel flat, blended across only about one screen pixel, for the world and the HUD. Before, it was bilinear smearing. | in game (shader live) |
 | Haze and lighting | Synchronized | Haze goes toward the colour of GTA's whole picture, from 40 m. Lighting tint comes from a wide blur. Neither shows what's behind a block. Edge softening defaults to 0.35. | in game (shader live) |
@@ -43,8 +43,10 @@ says how each row was checked:
 | Walk animation | Synchronized | It's driven by how far GTA's player moved each tick. | in game |
 | Creative flight (double-tap Space) | Synchronized | GTA's player is frozen and moved at Minecraft's flying speeds. Line-of-sight probes against GTA's map, cars and block props stop it. | built |
 | Elytra (Space in mid-air) | Synchronized | Minecraft's physics move Steve and GTA follows with a chase camera. Hitting a wall ends the glide. | in game (earlier build) |
-| Sprint, crouch and swim poses from GTA's movement | Not done | Steve walks or stands; GTA's crouch, swim and sprint don't change his pose. | |
-| Vehicles | Minecraft-only | Steve sits at GTA's player position in the car, without a seated pose. | in game |
+| Crouch, swim and seated poses from GTA's movement | Synchronized | GTA sends what its player is doing (`mv` in `cam`: sprint, stealth/duck, swimming, under water, seated in a vehicle, climbing). Steve gets Minecraft's own pose for it through the render state: `isCrouching`, swimming eased over about 0.25 s, `isPassenger`. The whole model takes the pose at once. | dev client (`host/pose_test.ps1`, frames checked) |
+| Sprint | Native | Minecraft's walk animation speeds up with GTA's speed. There's no separate sprint pose in Minecraft. | dev client |
+| Climbing | Not done | It's reported (`mv` 32), but Minecraft has no climbing pose for a player off a ladder. | |
+| Vehicles | Synchronized | Steve sits (Minecraft's riding pose) at GTA's seat. | dev client (pose); in game pending (seat height) |
 | /tp, /teleport, ender pearls | Synchronized | Minecraft's teleport moves GTA's player there (`pteleport`). | in game (pearls) |
 | /kill, damage to the player | Minecraft-only | Minecraft respawns right away. GTA's player is invincible by design. | |
 | /gamemode | Native | Survival works in Minecraft. GTA isn't affected. | |
@@ -150,8 +152,17 @@ render.overscan=1.12         # 1.0..1.5: how much wider Minecraft's view is than
   - kill Minecraft while GTA runs: the overlay says STALE and GTA's picture is untouched; start Minecraft again and it
     returns.
 
+- **Frames** (dev client): `host\frame_test.ps1 [-Rebuild]` spins and walks the camera while sections rebuild, and
+  measures non-opaque block pixels, coverage drops and torn reads. 2026-10-11: 0.00% non-opaque in 736 frames; torn
+  reads went from 4 of 259 to 0 of 257.
+- **Poses** (dev client): `host\pose_test.ps1` saves Minecraft's frame for each movement state to check by eye.
+- **Update and rollback:** `update_games.ps1` backs up, installs and verifies byte for byte.
+  `update_games.ps1 -SimulateFailure` checks the rollback: 2026-10-11, every file was identical to before.
+
 ## Rollback
 
+- **Each update:** every update backs up what it replaces into `Documents\Universal\MCPassthrough-Backups\<time>\` (with
+  `update.log`), and puts it back by itself if the update fails.
 - **GTA:** the files replaced by the first install are in `gta\build\game_backup_20261010\`. `gta\install.ps1
   -Remove -Edition Enhanced` takes out everything the installer adds.
 - **Minecraft:** remove `passthrough-0.1.0.jar` from the profile's `mods` folder. `config\passthrough.properties` can

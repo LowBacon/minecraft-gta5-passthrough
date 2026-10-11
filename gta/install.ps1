@@ -11,8 +11,9 @@
 #              file that isn't there is skipped if the game folder already has it (e.g. you installed ReShade yourself).
 #   -Build     the folder with MCPassthrough.asi (default build\, where build.bat puts it)
 #   -Force     replace a loader, ReShade or args.txt that some other mod (or you) put there
+#   -WhereOnly print the game folder it would install into, and stop
 param([string]$GtaDir = $env:GTA_DIR, [ValidateSet('', 'Legacy', 'Enhanced')][string]$Edition = '', [string]$Runtime = '',
-	[string]$Build = '', [switch]$Force, [switch]$Remove)
+	[string]$Build = '', [switch]$Force, [switch]$Remove, [switch]$WhereOnly)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 if (-not $Runtime) { $Runtime = Join-Path $here 'third_party\runtime' }
@@ -77,6 +78,7 @@ if (-not $Edition) {
 }
 $e = $editions[$Edition]
 if (-not (Test-Path (Join-Path $GtaDir $e.Exe))) { throw "$($e.Exe) not found in: $GtaDir" }
+if ($WhereOnly) { return $GtaDir }
 Write-Output "GTA V $Edition in $GtaDir"
 
 $shaders = 'reshade-shaders\Shaders'
