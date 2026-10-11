@@ -77,6 +77,11 @@ namespace
 	// diagnostics
 	std::atomic<int> g_statFps{0}, g_statAgeMs{-1}, g_statTorn{0};
 	std::atomic<bool> g_statStale{false};
+	// the script hands a pose every game frame; none for this long while GTA keeps presenting = the script isn't
+	// running (GTA's pause menu and map stop ScriptHookV scripts): GTA's picture shows untouched, never a stale overlay
+	constexpr int64_t kScriptGoneNanos = 250000000;
+	std::atomic<int64_t> g_lastPoseNanos{0};
+	std::atomic<bool> g_statScriptPaused{false};
 	int g_framesThisSecond = 0;
 	int64_t g_secondFrom = 0;
 
@@ -343,7 +348,9 @@ namespace
 			upload(runtime);
 		const int64_t now = now_nanos();
 		const bool stale = g_hasFrame && now - g_publishNanos > kStaleNanos;
-		on = on && g_hasFrame && !stale;
+		const bool scriptPaused = now - g_lastPoseNanos.load() > kScriptGoneNanos;
+		g_statScriptPaused = scriptPaused;
+		on = on && g_hasFrame && !stale && !scriptPaused;
 		g_statStale = stale;
 		g_statAgeMs = g_hasFrame ? int((now - g_publishNanos) / 1000000) : -1;
 		if (now - g_secondFrom >= 1000000000)
@@ -546,6 +553,7 @@ namespace compositor
 		std::lock_guard<std::mutex> lock(g_poseLock);
 		g_hostPoses[g_hostPoseCount % kPoses] = {yaw, pitch, roll, fov, x, y, z, true};
 		++g_hostPoseCount;
+		g_lastPoseNanos = now_nanos();
 	}
 
 	void set_host_player(double x, double y, double z)

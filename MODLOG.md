@@ -116,4 +116,17 @@ checked; FEATURES.md has the status of everything).
   and isPassenger. Frames checked: standing, crouching, swimming and seated all render as one whole model.
 - **Updater:** backup, verify and rollback, plus a log. The rollback was tested with -SimulateFailure.
 
+**2026-10-11 16:07, the toolkit folders were added** (skills/, knowledge/, .claude/ and others; no `um` CLI; git not
+installed).
+- **Read:** knowledge/games/gta-v/minecraft-passthrough.md (the author's note: pose lag 1 measured;
+  gotcha 16, a stale overlay over the pause menu), frame-compositing-depth-and-pose-sync.md,
+  d3d12-frame-readback-buffers-only.md, and the mod-any-game skill and safety rules.
+- **Built, not installed:** the pause-menu fix. The compositor hides Minecraft when no host pose has arrived for
+  250 ms, because the pause menu stops ScriptHookV scripts. The games were running, so the updater refused; it
+  installs with the next update .bat run.
+- **Still to do:**
+  - a token on the WebSocket (the safety rule asks for one);
+  - updating the knowledge note with these Enhanced findings (publishing only with the user's OK);
+  - `.claude/settings.json` runs `hooks/add-to-path.sh`, which isn't in this folder.
+
 **Installed:** `install.ps1 -Edition Enhanced`. The files it replaced are in `gta/build/game_backup_20261010/`.
