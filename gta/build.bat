@@ -1,0 +1,18 @@
+@echo off
+rem Builds MCPassthrough.asi (ScriptHookV script + ReShade add-on) with MSVC into build\. Run fetch_deps first.
+rem The same .asi runs in GTA V Legacy and Enhanced. Uses the newest Visual Studio with the C++ x64 tools
+rem (prereleases too: some Visual Studio 18 installs only show up that way); set VCVARS to another vcvars64.bat to pick one.
+setlocal
+set HERE=%~dp0
+set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
+if not defined VCVARS if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS for /d %%v in ("%ProgramFiles%\Microsoft Visual Studio\*") do for /d %%e in ("%%v\*") do if exist "%%e\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%e\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" (echo No Visual Studio with the C++ x64 tools was found. Install "Desktop development with C++" ^(Visual Studio 2022 or newer, or its Build Tools^), or set VCVARS to your vcvars64.bat& exit /b 1)
+if not exist "%HERE%third_party\shv\ScriptHookV.lib" (echo third_party is missing: run fetch_deps.ps1 ^(or fetch_deps.sh^) first& exit /b 1)
+call "%VCVARS%" >nul || exit /b 1
+if not exist "%HERE%build" mkdir "%HERE%build"
+cl /nologo /LD /O2 /EHsc /std:c++20 /MT /W3 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+  /I "%HERE%third_party\shv" /I "%HERE%third_party\reshade" ^
+  "%HERE%src\script.cpp" "%HERE%src\compositor.cpp" "%HERE%src\ws.cpp" ^
+  /Fo"%HERE%build\\" /Fe"%HERE%build\MCPassthrough.asi" ^
+  /link "%HERE%third_party\shv\ScriptHookV.lib" ws2_32.lib user32.lib
