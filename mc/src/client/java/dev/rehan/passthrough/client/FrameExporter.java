@@ -23,12 +23,19 @@ import org.joml.Vector4f;
  *   256 + 128 * i: slot i
  *     +0 long seq (odd while being written)   +8 long Minecraft frame   +16 long host frame
  *     +24 int width   +28 int height   +32 float near   +36 float far   +40 float vertical fov (degrees)
- *     +44 int flags: 1 = depth in [0, 1] (zZeroToOne), 2 = rows bottom-up, 4 = reversed Z (1 = near, 0 = far/empty)
+ *     +44 int flags: 1 = depth in [0, 1] (zZeroToOne), 2 = rows bottom-up, 4 = reversed Z (1 = near, 0 = far/empty),
+ *         32 = avatar layer: the player is drawn alone into layers 3 and 4 (and isn't in the world layer),
+ *         64 = GPU frame: the pixels are in shared D3D12 textures (GpuTransport), not in this slot
+ *   1024 + 32 * i: slot i's GPU frame: u32 generation, u32 set
+ *   2048 + 64 * i: slot i's scene: u32 magic "MCSC", u32 version 1, u64 mesh revision, u64 atlas revision, u64 mesh session
+ *     (all zero: the world layer has its chunks; else it left out exactly that native block mesh, which the host draws)
  *     +48 double camera x, +56 y, +64 z   +72 float yaw   +76 pitch   +80 roll   +84 int first person
  *     +88 long capture time (System.nanoTime)   +96 long publish time
  *     +104 double player (Steve's feet) x, +112 y, +120 z
  * slot i data at 4096 + i * stride, each layer width * height * 4 bytes:
- *   world colour RGBA8 (premultiplied alpha), world depth float32, overlay RGBA8 (hand + HUD, premultiplied alpha)
+ *   world colour RGBA8 (premultiplied alpha), world depth float32, overlay RGBA8 (hand + HUD, premultiplied alpha),
+ *   avatar colour RGBA8 and avatar depth float32 (flag 32 only)
+ * Max width/height (+24, +28) bound the frames carried in the slots; GPU frames can be larger (GpuTransport.MAX_W/H).
  * </pre>
  *
  * The world layer is copied just before the hand is drawn; the colour target is then cleared so what follows (hand,
@@ -43,10 +50,16 @@ public final class FrameExporter {
 	private static final int SLOTS = 3;
 	private static final int SLOT_DESC = 256;
 	private static final int SLOT_DESC_BYTES = 128;
-	private static final int MAX_W = 3840;
-	private static final int MAX_H = 2160;
+	/** Per slot, 32 bytes: u32 GPU generation, u32 GPU set (a GPU frame: flag 64 in the slot's flags). */
+	private static final int GPU_DESC = 1024;
+	/** Per slot, 64 bytes: the native block mesh revision the world layer left out (BlockMeshClient). */
+	private static final int SCENE_DESC = 2048, SCENE_MAGIC = 0x4353434D;
+	/** Slot frames (the readback path, GTA V Legacy): GPU frames aren't bound by this. */
+	private static final int MAX_W = 2560;
+	private static final int MAX_H = 1440;
 	private static final long LAYER_MAX = (long)MAX_W * MAX_H * 4;
-	private static final long STRIDE = LAYER_MAX * 3;
+	private static final long STRIDE = LAYER_MAX * 5;
+	static final int FLAG_AVATAR = 32;
 	private static final int RING = 3;
 	private static final long STUCK_NANOS = 1_000_000_000L;
 	private static final Vector4f TRANSPARENT = new Vector4f(0.0F, 0.0F, 0.0F, 0.0F);
@@ -67,6 +80,8 @@ public final class FrameExporter {
 	private static long frameCounter;
 	private static long publishCounter;
 	private static Capture current;
+	/** The newest capture went to shared GPU textures (not a slot). */
+	private static boolean lastGpu;
 
 	private FrameExporter() {
 	}
@@ -75,6 +90,11 @@ public final class FrameExporter {
 		GpuBuffer color;
 		GpuBuffer depth;
 		GpuBuffer overlay;
+		GpuBuffer avatarColor, avatarDepth;
+		/** The player was drawn into the avatar layers (flag 32). */
+		boolean avatar;
+		/** The native block mesh revision this frame's world layer left out (its chunks are the host's to draw), or NONE. */
+		BlockMeshClient.Exclusion exclusion = BlockMeshClient.Exclusion.NONE;
 		int width;
 		int height;
 		long generation;
@@ -84,6 +104,8 @@ public final class FrameExporter {
 		float far;
 		long frame;
 		long captureNanos;
+		/** The shared GPU texture set this capture writes (GpuTransport), or -1: the readback path. */
+		int gpuSet = -1;
 
 		void allocate(final int w, final int h) {
 			this.free();
@@ -97,13 +119,13 @@ public final class FrameExporter {
 		}
 
 		void free() {
-			for (GpuBuffer b : new GpuBuffer[]{this.color, this.depth, this.overlay}) {
+			for (GpuBuffer b : new GpuBuffer[]{this.color, this.depth, this.overlay, this.avatarColor, this.avatarDepth}) {
 				if (b != null) {
 					b.close();
 				}
 			}
 
-			this.color = this.depth = this.overlay = null;
+			this.color = this.depth = this.overlay = this.avatarColor = this.avatarDepth = null;
 		}
 	}
 
@@ -113,6 +135,19 @@ public final class FrameExporter {
 
 	public static boolean exporting() {
 		return shm != null;
+	}
+
+	/** A world layer was captured this frame and its overlay is still to come. */
+	public static boolean capturing() {
+		return current != null;
+	}
+
+	/**
+	 * Whether the avatar layers can be carried: slot frames always can, GPU frames only from a host sharing five planes. By
+	 * the path the newest capture took (a host that went away leaves its last GPU generation imported).
+	 */
+	public static boolean avatarPossible() {
+		return !lastGpu || GpuTransport.avatarPlanes();
 	}
 
 	private static boolean ensureShm() {
@@ -156,12 +191,9 @@ public final class FrameExporter {
 
 		int w = target.width;
 		int h = target.height;
-		if ((long)w * h * 4 > LAYER_MAX) {
-			if (!warnedSize) {
-				warnedSize = true;
-				Passthrough.LOG.warn("frame export: {}x{} is bigger than {}x{}, not exporting", w, h, MAX_W, MAX_H);
-			}
-
+		boolean slotFits = w <= MAX_W && h <= MAX_H;
+		if (w <= 0 || h <= 0 || w > GpuTransport.MAX_W || h > GpuTransport.MAX_H) {
+			tooBig(w, h, GpuTransport.MAX_W, GpuTransport.MAX_H);
 			return;
 		}
 
@@ -175,11 +207,39 @@ public final class FrameExporter {
 			return;
 		}
 
-		if (c.width != w || c.height != h || c.color == null) {
+		// GPU frames first (the host shares D3D12 textures: Enhanced); while it catches up the frame is dropped, never read
+		// back; a host without them (Legacy) leaves the readback path
+		c.gpuSet = GpuTransport.acquire(w, h);
+		if (c.gpuSet == GpuTransport.BUSY) {
+			return;
+		}
+
+		if (c.gpuSet >= 0 && !(GpuTransport.copyColor(target.getColorTexture(), c.gpuSet, 0) && GpuTransport.copyDepth(target.getDepthTexture(), c.gpuSet, 1))) {
+			GpuTransport.discard(c.gpuSet);
+			c.gpuSet = -1;
+		}
+
+		if (c.gpuSet < 0 && !slotFits) {
+			tooBig(w, h, MAX_W, MAX_H); // only GPU frames carry this size
+			return;
+		}
+
+		if (c.gpuSet >= 0) {
+			// readback buffers of another size must not survive into a later readback frame
+			if (c.color != null && (c.width != w || c.height != h)) {
+				c.free();
+			}
+
+			c.width = w;
+			c.height = h;
+		} else if (c.width != w || c.height != h || c.color == null) {
 			c.allocate(w, h);
 		}
 
+		lastGpu = c.gpuSet >= 0;
 		c.generation++;
+		c.avatar = false;
+		c.exclusion = BlockMeshClient.exclusion();
 		c.busy = true;
 		c.busySince = now;
 		c.pose = pose;
@@ -187,10 +247,62 @@ public final class FrameExporter {
 		c.frame = ++frameCounter;
 		c.captureNanos = now;
 		CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-		encoder.copyTextureToBuffer(target.getColorTexture(), c.color, 0L, () -> {}, 0);
-		encoder.copyTextureToBuffer(target.getDepthTexture(), c.depth, 0L, () -> {}, 0);
+		if (c.gpuSet < 0) {
+			encoder.copyTextureToBuffer(target.getColorTexture(), c.color, 0L, () -> {}, 0);
+			encoder.copyTextureToBuffer(target.getDepthTexture(), c.depth, 0L, () -> {}, 0);
+		}
+
 		encoder.clearColorTexture(target.getColorTexture(), TRANSPARENT);
 		current = c;
+	}
+
+	private static void tooBig(final int w, final int h, final int maxW, final int maxH) {
+		if (!warnedSize) {
+			warnedSize = true;
+			Passthrough.LOG.warn("frame export: {}x{} is bigger than {}x{}, not exporting", w, h, maxW, maxH);
+		}
+	}
+
+	/**
+	 * Right after captureWorld, the player drawn alone (HostAvatarRenderer) into the colour and depth targets: copied as
+	 * the avatar layers. False if they couldn't be (the capture is then abandoned: the world layer has no player in it).
+	 */
+	public static boolean captureAvatar(final RenderTarget target) {
+		Capture c = current;
+		if (c == null || target.width != c.width || target.height != c.height) {
+			return false;
+		}
+
+		if (c.gpuSet >= 0) {
+			if (!(GpuTransport.copyColor(target.getColorTexture(), c.gpuSet, 3) && GpuTransport.copyDepth(target.getDepthTexture(), c.gpuSet, 4))) {
+				return false;
+			}
+		} else {
+			if (c.avatarColor == null) {
+				long n = (long)c.width * c.height * 4;
+				int usage = GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST;
+				c.avatarColor = RenderSystem.getDevice().createBuffer(() -> "passthrough avatar colour", usage, n);
+				c.avatarDepth = RenderSystem.getDevice().createBuffer(() -> "passthrough avatar depth", usage, n);
+			}
+
+			CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+			encoder.copyTextureToBuffer(target.getColorTexture(), c.avatarColor, 0L, () -> {}, 0);
+			encoder.copyTextureToBuffer(target.getDepthTexture(), c.avatarDepth, 0L, () -> {}, 0);
+		}
+
+		c.avatar = true;
+		return true;
+	}
+
+	/** This frame's capture is dropped: nothing of it is published (the host keeps showing the last frame). */
+	public static void abandon() {
+		Capture c = current;
+		current = null;
+		if (c != null) {
+			GpuTransport.discard(c.gpuSet);
+			c.gpuSet = -1;
+			c.busy = false;
+		}
 	}
 
 	/** End of GameRenderer.render: the overlay (hand, screen effects, GUI) is complete. */
@@ -202,7 +314,25 @@ public final class FrameExporter {
 		}
 
 		if (target.width != c.width || target.height != c.height) {
+			GpuTransport.discard(c.gpuSet);
+			c.gpuSet = -1;
 			c.busy = false;
+			return;
+		}
+
+		if (c.gpuSet >= 0) {
+			// GPU frames: the overlay into its plane, the fence signalled with this frame's number, published now (the host
+			// copies once the GPU reaches the fence): no readback round trip at all
+			if (!GpuTransport.copyColor(target.getColorTexture(), c.gpuSet, 2)) {
+				GpuTransport.discard(c.gpuSet);
+				c.gpuSet = -1;
+				c.busy = false;
+				return;
+			}
+
+			GpuTransport.signal(c.gpuSet, c.frame);
+			ringNext = (ringNext + 1) % RING;
+			publish(c);
 			return;
 		}
 
@@ -216,6 +346,7 @@ public final class FrameExporter {
 	}
 
 	private static void publish(final Capture c) {
+		boolean published = false;
 		try {
 			MemorySegment m = shm.segment;
 			int slot = slotNext;
@@ -236,9 +367,31 @@ public final class FrameExporter {
 			VarHandle.fullFence();
 			long base = HEADER + STRIDE * slot;
 			long n = (long)c.width * c.height * 4;
-			copy(c.color, m, base, n);
-			copy(c.depth, m, base + n, n);
-			copy(c.overlay, m, base + 2 * n, n);
+			boolean gpu = c.gpuSet >= 0;
+			if (!gpu) {
+				copy(c.color, m, base, n);
+				copy(c.depth, m, base + n, n);
+				copy(c.overlay, m, base + 2 * n, n);
+				if (c.avatar) {
+					copy(c.avatarColor, m, base + 3 * n, n);
+					copy(c.avatarDepth, m, base + 4 * n, n);
+				}
+			}
+
+			// which shared texture set holds a GPU frame (inside the header, under this slot's seqlock)
+			long gpuDesc = GPU_DESC + 32L * slot;
+			m.set(INT, gpuDesc, gpu ? GpuTransport.generation() : 0);
+			m.set(INT, gpuDesc + 4, gpu ? c.gpuSet : 0);
+			// which native block mesh the world layer left out (inside the header, under this slot's seqlock)
+			long sceneDesc = SCENE_DESC + 64L * slot;
+			m.asSlice(sceneDesc, 64).fill((byte)0);
+			if (c.exclusion.active()) {
+				m.set(INT, sceneDesc, SCENE_MAGIC);
+				m.set(INT, sceneDesc + 4, 1);
+				m.set(LONG, sceneDesc + 8, c.exclusion.mesh());
+				m.set(LONG, sceneDesc + 16, c.exclusion.atlas());
+				m.set(LONG, sceneDesc + 24, c.exclusion.session());
+			}
 			HostState.Pose p = c.pose;
 			m.set(LONG, desc + 8, c.frame);
 			m.set(LONG, desc + 16, p.hostFrame());
@@ -247,7 +400,7 @@ public final class FrameExporter {
 			m.set(FLOAT, desc + 32, NEAR);
 			m.set(FLOAT, desc + 36, c.far);
 			m.set(FLOAT, desc + 40, HostState.renderFov(p)); // what it was rendered with (overscan included)
-			m.set(INT, desc + 44, (RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 1 : 0) | 2 | 4);
+			m.set(INT, desc + 44, (RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 1 : 0) | 2 | 4 | (c.avatar ? FLAG_AVATAR : 0) | (gpu ? GpuTransport.FLAG : 0));
 			m.set(DOUBLE, desc + 48, p.x());
 			m.set(DOUBLE, desc + 56, p.y());
 			m.set(DOUBLE, desc + 64, p.z());
@@ -266,9 +419,15 @@ public final class FrameExporter {
 			m.set(INT, 40, slot);
 			VarHandle.fullFence();
 			m.set(LONG, 32, ++publishCounter);
+			published = true;
 		} catch (RuntimeException e) {
 			Passthrough.LOG.warn("frame export failed", e);
 		} finally {
+			if (!published) {
+				GpuTransport.discard(c.gpuSet); // a set no descriptor names is never read by the host
+			}
+
+			c.gpuSet = -1;
 			c.busy = false;
 		}
 	}

@@ -6,5 +6,6 @@ if not defined VCVARS for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Mi
 if not exist "%VCVARS%" (echo No Visual Studio with the C++ x64 tools was found. Install "Desktop development with C++" ^(Visual Studio 2022 or its Build Tools^), or set VCVARS to your vcvars64.bat& exit /b 1)
 call "%VCVARS%" >nul 2>nul || exit /b 1
 cd /d "%~dp0"
-cl /nologo /O2 /EHsc /std:c++20 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I ..\third_party\reshade fakegta.cpp ..\src\compositor.cpp ..\src\ws.cpp /Fe:fakegta.exe ws2_32.lib user32.lib d3d11.lib d3dcompiler.lib || exit /b 1
-cl /nologo /O2 /EHsc /std:c++20 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX ws_test.cpp ..\src\ws.cpp /Fe:ws_test.exe ws2_32.lib
+cl /nologo /O2 /EHsc /std:c++20 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I ..\third_party\reshade fakegta.cpp ..\src\compositor.cpp ..\src\gpu_host.cpp ..\src\ws.cpp /Fe:fakegta.exe ws2_32.lib user32.lib d3d11.lib d3dcompiler.lib || exit /b 1
+cl /nologo /O2 /EHsc /std:c++20 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX ws_test.cpp ..\src\ws.cpp /Fe:ws_test.exe ws2_32.lib || exit /b 1
+cl /nologo /O2 /EHsc /std:c++20 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX gpu_frames_test.cpp /Fe:gpu_frames_test.exe d3d12.lib dxgi.lib

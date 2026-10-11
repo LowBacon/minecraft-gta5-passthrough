@@ -13,6 +13,10 @@ import java.util.List;
 import java.util.Locale;
 import net.minecraft.client.Minecraft;
 import org.java_websocket.WebSocket;
+import org.java_websocket.drafts.Draft;
+import org.java_websocket.exceptions.InvalidDataException;
+import org.java_websocket.framing.CloseFrame;
+import org.java_websocket.handshake.ServerHandshakeBuilder;
 import org.java_websocket.drafts.Draft_6455;
 import org.java_websocket.extensions.IExtension;
 import org.java_websocket.protocols.IProtocol;
@@ -36,9 +40,15 @@ import org.java_websocket.server.WebSocketServer;
  * Minecraft to host: {"t":"hello",...} on connect, {"t":"explosion","pos":[x,y,z],"r":radius},
  * {"t":"screen","open":bool} (a screen wants all the input).
  * Relayed unchanged to the other clients: {"t":"gta",...} (director commands for the host plugin), {"t":"gtastate",...}.
+ * {"t":"host","pid":n}: the host's process (the native block mesh is published for it).
+ *
+ * <p>Browsers can open WebSockets to 127.0.0.1 from any web page, and this link runs server commands: a handshake that
+ * carries an Origin header (every browser sends one, native clients don't) is refused.
  */
 public final class HostLink extends WebSocketServer {
 	private static HostLink instance;
+	/** The connection that said it's the host (its process id is the native mesh's); null: none. */
+	private static volatile WebSocket hostConnection;
 
 	/** No message the host sends comes near this; anything bigger is refused (a local endpoint isn't proof of trust). */
 	private static final int MAX_MESSAGE_BYTES = 4 << 20;
@@ -58,6 +68,17 @@ public final class HostLink extends WebSocketServer {
 	}
 
 	@Override
+	public ServerHandshakeBuilder onWebsocketHandshakeReceivedAsServer(final WebSocket conn, final Draft draft, final ClientHandshake request)
+		throws InvalidDataException {
+		if (request.hasFieldValue("Origin")) {
+			Passthrough.LOG.warn("refused a WebSocket from a web page (Origin {})", request.getFieldValue("Origin"));
+			throw new InvalidDataException(CloseFrame.POLICY_VALIDATION, "web pages may not connect");
+		}
+
+		return super.onWebsocketHandshakeReceivedAsServer(conn, draft, request);
+	}
+
+	@Override
 	public void onStart() {
 		Passthrough.LOG.info("host link listening on 127.0.0.1:{}", this.getPort());
 	}
@@ -71,6 +92,11 @@ public final class HostLink extends WebSocketServer {
 	@Override
 	public void onClose(final WebSocket conn, final int code, final String reason, final boolean remote) {
 		Passthrough.LOG.info("host disconnected ({} {})", code, reason);
+		if (conn == hostConnection) {
+			hostConnection = null;
+			HostState.hostPid(0);
+		}
+
 		// whatever the host was holding down (a key, a mouse button) comes up: nothing stays stuck in Minecraft
 		Minecraft minecraft = Minecraft.getInstance();
 		minecraft.execute(HostInput::releaseAll);
@@ -82,6 +108,11 @@ public final class HostLink extends WebSocketServer {
 			JsonObject m = JsonParser.parseString(message).getAsJsonObject();
 			switch (m.get("t").getAsString()) {
 				case "cam" -> HostState.update(m);
+				case "host" -> {
+					hostConnection = conn;
+					HostState.hostPid(m.get("pid").getAsLong());
+					Passthrough.LOG.info("host process {}", HostState.hostPid());
+				}
 				case "ground" -> WorldBridge.solid(ints(m.getAsJsonArray("c")));
 				case "clear" -> WorldBridge.clearSolid();
 				case "cmd" -> WorldBridge.command(m.get("c").getAsString());

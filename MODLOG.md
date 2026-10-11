@@ -129,4 +129,57 @@ installed).
   - updating the knowledge note with these Enhanced findings (publishing only with the user's OK);
   - `.claude/settings.json` runs `hooks/add-to-path.sh`, which isn't in this folder.
 
+**2026-10-11 21:36, EldenCraft's low-latency design** (the user's `..\EldenCraft-main`, MIT, Adam Grzegorzewski).
+- **Why it lags less:**
+  1. Shared GPU textures (ECGT): GL imports D3D12 shared resources and a fence, so there's no CPU readback.
+  2. Native blocks: baked block meshes are drawn by the compositor with the host camera at Present.
+  3. A per-Present camera history.
+- **Phase A done (GPU frames):**
+  - Ported: GpuTransport.java (3 planes; the control block is `Local\MCPassthroughGpuFrame`, magic MCGT) and
+    gta/src/gpu_host.{h,cpp} (D3D12 only; the add-on copies into its back set, fenced, and acks after the copy).
+  - The MCPT slot gets flag 64, with gen/set at 1024 + 32·slot.
+  - Once GPU frames are active, the script sizes Minecraft to GTA's full back buffer.
+  - Test `gta/tests/gpu_frames_test.exe` (a D3D12 stand-in host) against the dev client: PASS, 1309 of 1309 frames
+    with content, fence wait 0.06 ms. The frame image was checked.
+  - Installed with update_games (UPDATE OK). Not yet run in GTA.
+- **Phase B, not started (native blocks):** BlockMeshClient (bakes meshes, atlas, lightmap, animated sprites),
+  block_renderer.cpp (draws with the host camera and depth, sorts translucents), and leaving chunk geometry out of
+  the RGB-D capture once a mesh covers the view. This is the step that makes blocks fully lag-free.
+
 **Installed:** `install.ps1 -Edition Enhanced`. The files it replaced are in `gta/build/game_backup_20261010/`.
+
+**2026-10-11 22:40, Phase C: Steve in a layer of his own, see-through fix** (user: "i can still see trough blocks like
+they are samll transparent ... the steve also is samll transparetn ... see your own skin and the armor ... tearing apart
+on the head").
+- **What was measured first:**
+  - Minecraft's world and avatar layers are 100% opaque (0.00% non-opaque pixels), so the see-through look came from
+    the effect.
+  - The effect's lighting match took each block's brightness and colour from GTA's picture blurred over about 37 px,
+    so the shapes behind a block showed through it.
+  - The head tearing: Steve was cut out of the world picture with a 1.84 m box round his middle. His head, helmet and
+    hat stuck out of it, so they were re-projected with the world and left behind.
+- **Ported from EldenCraft (MIT):**
+  - HostAvatarRenderer.java: the local player drawn alone with vanilla's renderer, the world pass's camera and lens.
+  - AvatarLayerMixin: the world pass leaves the player out (from SceneLevelRendererMixin).
+  - The effect's camera-relative avatar sample (from EcAvatar).
+  - The transport carries 5 planes: GPU planes 3 and 4, slot layers 3 and 4, slot flag 32. The CPU slots are
+    capped at 2560x1440 (5 layers, 221 MB), and GPU frames still go up to 4K.
+  - An add-on with 3 planes keeps Steve in the world.
+- **Also:**
+  - Own skin by default (render.ownSkin).
+  - Light blur mip 3.2 → 4.6 with narrower gain and tint, premultiplied haze, edge softening 0.15.
+  - The avatar is kept out of the bloom.
+  - Debug views 4 to 6 for the avatar layer.
+- **Tests (dev client only; GTA and Modrinth Minecraft were closed):**
+  - pose_test: every pose whole, with the helmet and chestplate.
+  - gpu_frames_test: PASS with 5 planes (941 of 941 frames with avatar) and with 3 planes (927 frames, none).
+  - frame_test: 0.00% non-opaque in 232 frames.
+  - fakegta third person (new `third` mode plus BMP screenshots): Steve solid in every shot while walking and while
+    the camera swings, ordered right against GTA and the blocks.
+  - Found and fixed on the way:
+    - A host that left with 3 planes kept the avatar layer off on the CPU path (now it follows the path of the
+      newest capture).
+    - fakegta's clear (`fill` of 63k blocks) was over Minecraft's 32,768 limit, so it silently failed and earlier
+      tests' blocks buried the player.
+- **Still not ported (Phase B):** EldenCraft's native block meshes. Blocks are still re-projected RGB-D, so GTA can
+  show for a frame where a turn uncovers what Minecraft didn't draw.

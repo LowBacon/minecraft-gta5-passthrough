@@ -13,6 +13,6 @@ call "%VCVARS%" >nul || exit /b 1
 if not exist "%HERE%build" mkdir "%HERE%build"
 cl /nologo /LD /O2 /EHsc /std:c++20 /MT /W3 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
   /I "%HERE%third_party\shv" /I "%HERE%third_party\reshade" ^
-  "%HERE%src\script.cpp" "%HERE%src\compositor.cpp" "%HERE%src\ws.cpp" ^
+  "%HERE%src\script.cpp" "%HERE%src\compositor.cpp" "%HERE%src\gpu_host.cpp" "%HERE%src\ws.cpp" ^
   /Fo"%HERE%build\\" /Fe"%HERE%build\MCPassthrough.asi" ^
   /link "%HERE%third_party\shv\ScriptHookV.lib" ws2_32.lib user32.lib

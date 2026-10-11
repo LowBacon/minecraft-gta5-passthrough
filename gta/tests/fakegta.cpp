@@ -4,8 +4,12 @@
 // WebSocket client, while ReShade (dxgi.dll next to the exe) runs MCPassthrough.fx with the compositor add-on
 // compiled in here.
 //
-//   fakegta.exe [seconds]
+//   fakegta.exe [seconds] [shake 0/1] [third] [screenshot prefix]
+// third: a stand-in player walks to and fro in third person (the camera behind, turning round them); screenshot prefix:
+// the finished picture (ReShade's, effects included) is saved as <prefix>_<n>.bmp every two seconds from 3 s on.
 #include "../src/compositor.h"
+#include <reshade.hpp>
+#include <atomic>
 #include "../src/ws.h"
 #include <windows.h>
 #include <d3d11.h>
@@ -138,6 +142,47 @@ float4 ps(VSOut i) : SV_Target
 		float tx = 0, ty = 0, speed = 1;
 	} g_player;
 
+	std::string g_shotPrefix;
+	std::atomic<double> g_now{0.0};
+	double g_nextShot = 3.0;
+	int g_shotCount = 0;
+
+	/// ReShade present (after the effects): save the finished picture when one is due.
+	void on_present_shot(reshade::api::effect_runtime *runtime)
+	{
+		if (g_shotPrefix.empty() || g_now.load() < g_nextShot)
+			return;
+		g_nextShot += 2.0;
+		uint32_t w = 0, h = 0;
+		runtime->get_screenshot_width_and_height(&w, &h);
+		std::vector<uint8_t> rgba(size_t(w) * h * 4);
+		if (w == 0 || !runtime->capture_screenshot(rgba.data()))
+			return;
+		const std::string path = g_shotPrefix + "_" + std::to_string(++g_shotCount) + ".bmp";
+		FILE *file = std::fopen(path.c_str(), "wb");
+		if (file == nullptr)
+			return;
+		const uint32_t row = w * 3, pad = (4 - row % 4) % 4, size = 54 + (row + pad) * h;
+		uint8_t header[54] = {'B', 'M'};
+		auto put32 = [&](int at, uint32_t v) { std::memcpy(header + at, &v, 4); };
+		put32(2, size); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h);
+		header[26] = 1; header[28] = 24;
+		std::fwrite(header, 1, 54, file);
+		const uint8_t zero[3] = {0, 0, 0};
+		for (uint32_t y = h; y-- > 0;)
+		{
+			for (uint32_t x = 0; x < w; ++x)
+			{
+				const uint8_t *p = &rgba[(size_t(y) * w + x) * 4];
+				const uint8_t bgr[3] = {p[2], p[1], p[0]};
+				std::fwrite(bgr, 1, 3, file);
+			}
+			std::fwrite(zero, 1, pad, file);
+		}
+		std::fclose(file);
+		std::printf("screenshot %s at %.1f s\n", path.c_str(), g_now.load());
+	}
+
 	double num(const std::string &m, const char *key, double fallback)
 	{
 		const std::string k = std::string("\"") + key + "\":";
@@ -194,6 +239,9 @@ int main(int argc, char **argv)
 {
 	const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
 	const bool shake = argc > 2 && std::atoi(argv[2]) != 0; // fast camera swings (~235 deg/s) to show latency
+	const bool third = argc > 3 && std::strcmp(argv[3], "third") == 0;
+	if (argc > 4)
+		g_shotPrefix = argv[4];
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = wndproc;
 	wc.hInstance = GetModuleHandleW(nullptr);
@@ -223,6 +271,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	std::printf("compositor registered with ReShade: %s\n", compositor::try_register(GetModuleHandleW(nullptr)) ? "yes" : "no (is dxgi.dll ReShade?)");
+	if (!g_shotPrefix.empty())
+		reshade::register_event<reshade::addon_event::reshade_present>(on_present_shot);
 
 	ID3D11Texture2D *back = nullptr;
 	swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back));
@@ -300,7 +350,13 @@ int main(int argc, char **argv)
 	WsClient ws;
 	ws.start("127.0.0.1", 25599);
 	int generation = -1;
-	bool scripted = false; // true once a director op arrives: the camera follows the stand-in player
+	bool scripted = third; // true once a director op arrives (or in third): the camera follows the stand-in player
+	if (third)
+	{
+		g_player.x = 0.5f;
+		g_player.y = -0.5f;
+		g_player.view = 1;
+	}
 	const auto t0 = std::chrono::steady_clock::now();
 	int frame = 0;
 	MSG msg = {};
@@ -314,6 +370,17 @@ int main(int argc, char **argv)
 		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 		if (t > seconds)
 			break;
+		g_now = t;
+		if (third && !g_player.walking)
+		{
+			// to and fro past the Minecraft blocks, the camera swinging round the player as it goes
+			g_player.tx = 0.5f;
+			g_player.ty = g_player.y > -2.0f ? -4.0f : -0.5f;
+			g_player.speed = 1.4f;
+			g_player.walking = true;
+		}
+		if (third)
+			g_player.relHeading = 35.0f * float(std::sin(t * 0.8)), g_player.relPitch = -26.0f;
 		++frame;
 		compositor::try_register(GetModuleHandleW(nullptr));
 		compositor::set_active(ws.connected());
@@ -364,7 +431,7 @@ int main(int argc, char **argv)
 					for (int z = -30; z <= 30; ++z)
 						cols += (cols.empty() ? "" : ",") + std::to_string(x) + "," + std::to_string(z) + ",62,63";
 				ws.send("{\"t\":\"ground\",\"c\":[" + cols + "]}");
-				for (const char *c : {"fill -30 64 -30 30 80 30 minecraft:air", "fill 0 64 6 0 66 6 minecraft:diamond_block",
+				for (const char *c : {"fill -25 64 -25 25 75 25 minecraft:air", "fill 0 64 6 0 66 6 minecraft:diamond_block",
 						 "setblock 2 64 6 minecraft:tnt", "setblock 2 64 8 minecraft:glass", "fill -1 64 9 1 64 9 minecraft:oak_planks",
 						 "setblock -2 64 3 minecraft:grass_block", "setblock 4 64 10 minecraft:gold_block"})
 					ws.send(std::string("{\"t\":\"cmd\",\"c\":\"") + c + "\"}");
@@ -372,6 +439,7 @@ int main(int argc, char **argv)
 			// the same conversion as the GTA script: MC = (x, z + yOffset, -y), yaw = 180 - heading, pitch = -pitch
 			float mcYaw = std::fmod(180.0f - yaw + 540.0f, 360.0f) - 180.0f;
 			compositor::set_host_pose(mcYaw, -pitch, 0.0f, kFov, eye[0], eye[2] + kYOffset, -eye[1]);
+			compositor::set_host_player(g_player.x, g_player.z - 1.0f + kYOffset, -g_player.y);
 			char buf[512];
 			const Player &pl = g_player;
 			const bool fp = !scripted || pl.view == 4;

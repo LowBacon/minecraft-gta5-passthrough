@@ -32,6 +32,8 @@ public final class HostState {
 
 	private static final long TIMEOUT_NANOS = 2_000_000_000L;
 	private static volatile Pose latest;
+	/** The host's process id ({"t":"host","pid":n} on connect): the native block mesh is published for that process. */
+	private static volatile long hostPid;
 	/** The pose this frame renders with, taken once per frame so every hook agrees. Render thread only. */
 	private static Pose frame;
 
@@ -73,6 +75,15 @@ public final class HostState {
 
 		double half = Math.toRadians(p.fov()) * 0.5;
 		return (float) Math.toDegrees(2.0 * Math.atan(Math.tan(half) * dev.rehan.passthrough.Config.overscan));
+	}
+
+	static void hostPid(final long pid) {
+		hostPid = pid > 0 && pid <= 0xffffffffL ? pid : 0;
+	}
+
+	/** The connected host's process id, or 0 (unknown: an older host, or none). */
+	public static long hostPid() {
+		return hostPid;
 	}
 
 	/** The latest pose if the host is still sending, else null. */

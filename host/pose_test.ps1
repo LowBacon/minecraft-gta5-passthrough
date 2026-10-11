@@ -1,6 +1,7 @@
 # Steve's poses, against the DEV client only (mc\gradlew.bat runClient): plays the host with a third-person camera on
 # Steve and sends each movement state the GTA plugin sends ("mv": 0 standing, 1 sprint, 2 crouch, 4 swim, 16 seated),
-# saving Minecraft's exported world layer for each as a PNG in -Out (look at them: one whole Steve, in that pose).
+# saving Minecraft's exported layers for each as PNGs in -Out (look at them: one whole Steve, in that pose). With the
+# avatar layer (slot flag 32) the player is in layer 3, not the world: *_avatar.png is that layer, *_world.png has no Steve.
 param([string]$Out = "$PSScriptRoot\pose_test_out")
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -12,7 +13,14 @@ using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 public static class McShot
 {
-	public static long Save(string png)
+	public static int Flags()
+	{
+		using (var mmf = MemoryMappedFile.OpenExisting("Local\\MCPassthroughFrame", MemoryMappedFileRights.Read))
+		using (var view = mmf.CreateViewAccessor(0, 4096, MemoryMappedFileAccess.Read))
+			return view.ReadInt32(256 + 128L * view.ReadInt32(40) + 44);
+	}
+	public static long Save(string png) { return Save(png, 0); }
+	public static long Save(string png, int layer)
 	{
 		using (var mmf = MemoryMappedFile.OpenExisting("Local\\MCPassthroughFrame", MemoryMappedFileRights.ReadWrite))
 		using (var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite))
@@ -23,7 +31,7 @@ public static class McShot
 			{
 				long desc = 256 + 128L * slot;
 				int w = view.ReadInt32(desc + 24), h = view.ReadInt32(desc + 28);
-				long baseOff = 4096 + view.ReadInt64(16) * slot;
+				long baseOff = 4096 + view.ReadInt64(16) * slot + (long)layer * w * h * 4;
 				var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
 				var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
 				byte[] row = new byte[w * 4];
@@ -60,11 +68,13 @@ function Drain { while ($c.Available -gt 0) { $b = New-Object byte[] $c.Availabl
 $f = 0
 function Cam([int]$mv) { Send ("{`"t`":`"cam`",`"f`":$((++$script:f)),`"p`":[2.8,66.9,2.8],`"r`":[135,18,0],`"fov`":60,`"fp`":false,`"pl`":[0.5,65,0.5],`"h`":150,`"mv`":$mv}") }
 for ($i = 0; $i -lt 30; $i++) { Cam 0; Start-Sleep -Milliseconds 33; Drain }
-foreach ($cmd in 'fill -6 64 -6 6 64 6 minecraft:grass_block', 'fill -6 65 -6 6 70 6 minecraft:air') { Send "{`"t`":`"cmd`",`"c`":`"$cmd`"}"; Start-Sleep -Milliseconds 80 }
+foreach ($cmd in 'fill -6 64 -6 6 64 6 minecraft:grass_block', 'fill -6 65 -6 6 70 6 minecraft:air', 'item replace entity @a armor.head with minecraft:diamond_helmet', 'item replace entity @a armor.chest with minecraft:iron_chestplate') { Send "{`"t`":`"cmd`",`"c`":`"$cmd`"}"; Start-Sleep -Milliseconds 80 }
 foreach ($state in @(@(0, 'standing'), @(1, 'sprinting'), @(2, 'crouching'), @(4, 'swimming'), @(16, 'seated'), @(0, 'standing_again'))) {
 	for ($i = 0; $i -lt 45; $i++) { Cam $state[0]; Start-Sleep -Milliseconds 33; Drain } # 1.5 s: let it settle (swimming eases in)
-	$frame = [McShot]::Save((Join-Path $Out ("pose_{0:00}_{1}.png" -f $state[0], $state[1])))
-	"{0,-15} mv={1,-2} Minecraft frame {2}" -f $state[1], $state[0], $frame
+	$flags = [McShot]::Flags()
+	$frame = [McShot]::Save((Join-Path $Out ("pose_{0:00}_{1}_world.png" -f $state[0], $state[1])))
+	if ($flags -band 32) { [void][McShot]::Save((Join-Path $Out ("pose_{0:00}_{1}_avatar.png" -f $state[0], $state[1])), 3) }
+	"{0,-15} mv={1,-2} Minecraft frame {2}  avatar layer {3}" -f $state[1], $state[0], $frame, [bool]($flags -band 32)
 }
 $c.Close()
 "PNGs: $Out"

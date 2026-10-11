@@ -3,6 +3,9 @@
 //
 // world: premultiplied RGBA, drawn where Minecraft is nearer than GTA's depth buffer (both in metres).
 // overlay: Minecraft's hand, HUD and screens, always on top.
+// avatar (third person): the player alone, skin, armour and all, shown as Minecraft drew them (camera-relative, never
+// re-projected: re-projection is what tore the head and left copies behind), depth-tested against GTA and the world.
+// The avatar layer follows EldenCraft's EcAvatar (MIT, Copyright (c) 2026 Adam Grzegorzewski, github.com/SocketByte/EldenCraft).
 #include "ReShade.fxh"
 
 texture MCWorldTex : MCWORLD;
@@ -11,6 +14,12 @@ texture MCOverlayTex : MCOVERLAY;
 sampler sWorld { Texture = MCWorldTex; AddressU = CLAMP; AddressV = CLAMP; };
 sampler sDepth { Texture = MCDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 sampler sOverlay { Texture = MCOverlayTex; AddressU = CLAMP; AddressV = CLAMP; };
+texture MCAvatarTex : MCAVATAR;
+texture MCAvatarDepthTex : MCAVATARDEPTH;
+sampler sAvatar { Texture = MCAvatarTex; AddressU = CLAMP; AddressV = CLAMP; };
+sampler sAvatarDepth { Texture = MCAvatarDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+// Set by the add-on: the shown frame has the avatar layer (then the world layer has no player in it).
+uniform bool AvatarReady = false;
 
 // x = near, y = far, z = flags (1: [0,1] depth, 2: rows bottom-up, 4: reversed Z). Set by the add-on.
 uniform float3 McPlanes = float3(0.05, 2048.0, 7.0);
@@ -29,11 +38,12 @@ uniform float MaxBias < ui_type = "drag"; ui_min = 0.1; ui_max = 10.0; ui_step =
 uniform float HostDepthScale < ui_type = "drag"; ui_min = 0.5; ui_max = 2.0; ui_step = 0.001; ui_label = "GTA depth scale";
 	ui_tooltip = "Calibration: multiplies GTA's linearised depth."; > = 1.0;
 uniform float LightMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match GTA lighting";
-	ui_tooltip = "Relight Minecraft by the (blurred) GTA picture around it: darker in shade, tinted by nearby light."; > = 0.8;
+	ui_tooltip = "Relight Minecraft by the (blurred) GTA picture around it: darker in shade, tinted by nearby light."; > = 0.7;
 uniform float LightReference < ui_type = "drag"; ui_min = 0.1; ui_max = 1.0; ui_step = 0.01; ui_label = "Neutral brightness";
 	ui_tooltip = "GTA brightness at which Minecraft keeps its own colours."; > = 0.42;
-uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.55;
-uniform float LightBlur < ui_type = "drag"; ui_min = 1.0; ui_max = 6.0; ui_step = 0.1; ui_label = "Light blur (mip)"; > = 3.2;
+uniform float LightTint < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Light colour"; > = 0.3;
+uniform float LightBlur < ui_type = "drag"; ui_min = 1.0; ui_max = 6.0; ui_step = 0.1; ui_label = "Light blur (mip)";
+	ui_tooltip = "How wide an area of GTA's picture lights each Minecraft pixel. Low values let the shapes of what's behind a block show through it (a see-through look)."; > = 4.6;
 uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match GTA colour grade";
 	ui_tooltip = "Give Minecraft the colour of GTA's whole picture (a red Nether night, an orange sunset), as GTA's own grading does to its world."; > = 0.55;
 uniform float HazeStart < ui_type = "drag"; ui_min = 0.0; ui_max = 200.0; ui_step = 1.0; ui_label = "Haze start (m)"; > = 40.0;
@@ -43,7 +53,7 @@ uniform float HazeStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_st
 uniform bool CrispPixels < ui_label = "Crisp Minecraft pixels";
 	ui_tooltip = "Scale Minecraft's pixel art up sharp (each texel flat) instead of blurring it."; > = true;
 uniform float EdgeSoftness < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Soften Minecraft's edges";
-	ui_tooltip = "Anti-alias where Minecraft meets GTA (GTA's own anti-aliasing ran before Minecraft was added). High values blend edge pixels into GTA, which reads as a see-through rim."; > = 0.35;
+	ui_tooltip = "Anti-alias where Minecraft meets GTA (GTA's own anti-aliasing ran before Minecraft was added). High values blend edge pixels into GTA, which reads as a see-through rim."; > = 0.15;
 uniform float ContactShadow < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Contact shadows";
 	ui_tooltip = "Darken GTA's surfaces right next to Minecraft's (under mobs' feet, around blocks)."; > = 0.5;
 uniform float ContactRadius < ui_type = "drag"; ui_min = 0.1; ui_max = 3.0; ui_step = 0.05; ui_label = "Contact shadow size (m)"; > = 0.7;
@@ -55,7 +65,7 @@ uniform float BloomThreshold < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_
 uniform float3 Shake = float3(0.0, 0.0, 0.0);
 uniform float PortalWarp = 0.0;
 uniform float Timer < source = "timer"; >;
-uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0GTA depth (1 m bands)\0Minecraft depth (1 m bands)\0Depth difference\0"; > = 0;
+uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0GTA depth (1 m bands)\0Minecraft depth (1 m bands)\0Depth difference\0Avatar layer (red: none this frame)\0Avatar depth test (green: shown, red: behind GTA)\0Avatar vs world (blue: avatar nearer, yellow: world nearer)\0"; > = 0;
 uniform bool Reproject < ui_label = "Re-project to GTA's camera"; ui_tooltip = "Rotate Minecraft's (slightly older) frame onto GTA's current camera."; > = true;
 uniform float PosePrediction < ui_type = "drag"; ui_min = -2.0; ui_max = 3.0; ui_step = 0.05; ui_label = "Pose prediction (frames)";
 	ui_tooltip = "Extrapolate GTA's camera rotation by this many frames before re-projecting."; > = 0.0;
@@ -107,15 +117,16 @@ float4 PS_Light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 /// Minecraft renders at full daylight, so treat its colour as albedo and light it with GTA's local light; then give it
 /// GTA's colour grade (the whole picture's colour) and, far away, GTA's haze (fade into the picture around it).
-float3 relight(float3 c, float2 uv, float zm)
+float3 relight(float3 c, float a, float2 uv, float zm)
 {
 	// the light here: GTA's picture blurred well past any single thing behind this pixel (a sky or a wall right behind a
-	// block mustn't show in it), its brightness local, its colour from a wider area still
+	// block mustn't show in it: that reads as the block being see-through), its brightness local, its colour from a wider
+	// area still, and both kept within a narrow range for the same reason
 	const float3 L = tex2Dlod(sGtaLight, float4(uv, 0, LightBlur)).rgb;
-	const float3 W = tex2Dlod(sGtaLight, float4(uv, 0, LightBlur + 1.5)).rgb;
+	const float3 W = tex2Dlod(sGtaLight, float4(uv, 0, min(LightBlur + 1.5, 6.0))).rgb;
 	const float lum = luma(L);
-	const float gain = clamp(lum / LightReference, 0.42, 1.3);
-	const float3 tint = clamp(lerp(1.0, W / max(luma(W), 1e-3), LightTint), 0.6, 1.4);
+	const float gain = clamp(lum / LightReference, 0.6, 1.2);
+	const float3 tint = clamp(lerp(1.0, W / max(luma(W), 1e-3), LightTint), 0.75, 1.25);
 	c = lerp(c, c * gain * tint, LightMatch);
 	// the picture's grade, gentled (GTA's own grade keeps some colour in everything) and kept off lights (bright
 	// things keep their colour: fire, lava, the portal)
@@ -123,9 +134,9 @@ float3 relight(float3 c, float2 uv, float zm)
 	const float3 grade = clamp(lerp(1.0, M / max(luma(M), 1e-3), 0.6), 0.6, 1.6);
 	c = lerp(c, c * grade, GradeMatch * (1.0 - saturate((max(c.r, max(c.g, c.b)) - 0.45) * 2.5)));
 	// far away, GTA's haze: towards the colour of GTA's whole picture (its air), never towards what's behind the block,
-	// which would make far blocks see-through
+	// which would make far blocks see-through (premultiplied: the haze only where Minecraft covers)
 	const float h = saturate((1.0 - exp(-max(zm - HazeStart, 0.0) / HazeDistance)) * HazeStrength);
-	return lerp(c, M, h);
+	return lerp(c, M * a, h);
 }
 
 /// Minecraft's picture is pixel art, scaled up and re-projected: sample it crisp (each texel flat, blended only across
@@ -302,14 +313,61 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 
 	const float visible = zm < zh + allow ? 1.0 : 0.0;
 	const float cover = world.a * visible;
-	outColor = float4(relight(world.rgb, uv, zm) * visible + host * (1.0 - cover), 1.0);
+	const float3 worldLit = relight(world.rgb, world.a, uv, zm) * visible;
+
+	// the player's own layer, as Minecraft drew it: only GTA's current lens is applied (its frame can be wider)
+	float4 avatar = 0.0;
+	float za = 1e9;
+	if (AvatarReady)
+	{
+		const float2 auv = (ouv - 0.5) * (WarpTan.x / max(WarpTan.y, 1e-3)) + 0.5;
+		if (all(auv >= 0.0) && all(auv <= 1.0))
+		{
+			const float d = tex2Dlod(sAvatarDepth, float4(auv, 0, 0)).r;
+			if (d > 0.0) // reversed Z: 0 is nothing drawn
+			{
+				za = mc_linear(d);
+				avatar = CrispPixels ? sample_crisp(sAvatar, auv, mcSize, texelsPerPixel) : tex2D(sAvatar, auv);
+			}
+		}
+	}
+	if (DebugView == 4)
+	{
+		outColor = float4(avatar.a > 0.0 ? avatar.rgb : host * 0.3 + (AvatarReady ? 0.0 : float3(0.4, 0.0, 0.0)), 1.0);
+		return;
+	}
+	if (DebugView == 5)
+	{
+		outColor = float4(avatar.a > 0.0 ? (za < zh + allow ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)) * saturate(za / 8.0) : host * 0.3, 1.0);
+		return;
+	}
+	if (DebugView == 6)
+	{
+		outColor = float4(avatar.a > 0.0 ? (cover <= 0.0 ? float3(0.5, 0.5, 0.5) : za <= zm ? float3(0.0, 0.3, 1.0) : float3(1.0, 0.9, 0.0)) : host * 0.3, 1.0);
+		return;
+	}
+	const float aCover = za < zh + allow ? avatar.a : 0.0;
+	if (aCover > 0.0)
+	{
+		const float3 avatarLit = relight(avatar.rgb, avatar.a, uv, za);
+		// nearest first: the player in front of the world, or a block between the camera and the player
+		const float3 c = za <= zm || cover <= 0.0 ? avatarLit + (worldLit + host * (1.0 - cover)) * (1.0 - aCover)
+			: worldLit + (avatarLit + host * (1.0 - aCover)) * (1.0 - cover);
+		const float both = 1.0 - (1.0 - cover) * (1.0 - aCover);
+		outColor = float4(c, 1.0);
+		// w: how much of this is the player (no glow on them: armour and skin aren't lights)
+		outInfo = float4(both, cover > 0.0 ? min(zm, za) : za, zh, za <= zm || cover <= 0.0 ? aCover : 0.0);
+		return;
+	}
+	outColor = float4(worldLit + host * (1.0 - cover), 1.0);
 	outInfo = float4(cover, cover > 0.0 ? zm : 0.0, zh, 0.0);
 }
 
 /// Minecraft's bright parts (lava, fire, the portal, blazes): what glows.
 float4 PS_Bright(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-	const float cover = tex2D(sMcInfo, uv).x;
+	const float4 info = tex2D(sMcInfo, uv);
+	const float cover = info.x * (1.0 - info.w);
 	const float3 c = tex2D(sComposite, uv).rgb;
 	const float l = luma(c);
 	return float4(c * (cover * saturate((l - BloomThreshold) / max(1.0 - BloomThreshold, 1e-3)) / max(l, 1e-3)), 1.0);

@@ -1,4 +1,5 @@
 #include "compositor.h"
+#include "gpu_host.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,9 @@ namespace
 	constexpr int kHeader = 4096;
 	constexpr int kSlotDesc = 256;
 	constexpr int kSlotDescBytes = 128;
+	constexpr int kGpuDesc = 1024; // + 32 * slot: u32 GPU generation, u32 set (for slots flagged 64)
+	constexpr int32_t kFlagAvatar = 32; // the player alone in layers 3 (colour) and 4 (depth), not in the world layer
+	constexpr uint32_t kMaxGpuW = 3840, kMaxGpuH = 2160; // GPU frames aren't bound by the slots' size
 	constexpr const char *kEffect = "MCPassthrough.fx";
 
 	std::atomic<bool> g_registered{false};
@@ -67,13 +71,20 @@ namespace
 	};
 	// Two sets: a frame is uploaded into the back one and shown only once it's known whole (Minecraft didn't rewrite the
 	// slot meanwhile), so a torn frame never reaches the screen.
-	Layer g_world[2], g_depth[2], g_overlay[2];
+	Layer g_world[2], g_depth[2], g_overlay[2], g_avatar[2], g_avatarDepth[2];
+	bool g_mcAvatar = false; // the shown frame has the avatar layers
 	int g_front = 0;
 	uint32_t g_width = 0, g_height = 0;
 	bool g_hasFrame = false;
 	// Minecraft stopped publishing (crashed, frozen, its window minimized) for this long: GTA's picture goes untouched
 	constexpr int64_t kStaleNanos = 1500000000;
 	int64_t g_publishNanos = 0; // when the newest shown frame was published (Minecraft's nanoTime = this QPC clock)
+	// GPU frames (D3D12, GTA V Enhanced): Minecraft writes into textures shared from here; copies are fenced
+	gpu::Host g_gpu;
+	fence g_copyFence = {0};
+	uint64_t g_copyValue = 0;
+	std::atomic<int> g_statGpuFrames{0};
+	std::atomic<bool> g_gpuActive{false};
 	// diagnostics
 	std::atomic<int> g_statFps{0}, g_statAgeMs{-1}, g_statTorn{0};
 	std::atomic<bool> g_statStale{false};
@@ -150,7 +161,7 @@ namespace
 	void destroy_layers(device *dev)
 	{
 		for (int i = 0; i < 2; ++i)
-			for (Layer *layer : {&g_world[i], &g_depth[i], &g_overlay[i]})
+			for (Layer *layer : {&g_world[i], &g_depth[i], &g_overlay[i], &g_avatar[i], &g_avatarDepth[i]})
 			{
 				if (layer->srv.handle != 0)
 					dev->destroy_resource_view(layer->srv);
@@ -176,6 +187,8 @@ namespace
 		runtime->update_texture_bindings("MCWORLD", g_world[g_front].srv, g_world[g_front].srv);
 		runtime->update_texture_bindings("MCDEPTH", g_depth[g_front].srv, g_depth[g_front].srv);
 		runtime->update_texture_bindings("MCOVERLAY", g_overlay[g_front].srv, g_overlay[g_front].srv);
+		runtime->update_texture_bindings("MCAVATAR", g_avatar[g_front].srv, g_avatar[g_front].srv);
+		runtime->update_texture_bindings("MCAVATARDEPTH", g_avatarDepth[g_front].srv, g_avatarDepth[g_front].srv);
 	}
 
 	/// Upload the newest published Minecraft frame, if there is one we haven't shown yet.
@@ -192,8 +205,13 @@ namespace
 		if (seq & 1)
 			return;
 		const uint32_t w = read<uint32_t>(desc + 24), h = read<uint32_t>(desc + 28);
-		if (w == 0 || h == 0 || int64_t(w) > g_maxW || int64_t(h) > g_maxH || int64_t(w) * h * 4 * 3 > g_stride)
-			return; // not a frame this mapping can hold: never read past it
+		const int32_t flags = read<int32_t>(desc + 44);
+		const bool gpuFrame = (flags & int32_t(gpu::kFlag)) != 0, avatar = (flags & kFlagAvatar) != 0;
+		if (w == 0 || h == 0)
+			return;
+		if (gpuFrame ? (w > kMaxGpuW || h > kMaxGpuH)
+					 : (int64_t(w) > g_maxW || int64_t(h) > g_maxH || int64_t(w) * h * 4 * (avatar ? 5 : 3) > g_stride))
+			return; // not a frame this mapping (or the shared textures) can hold: never read past it
 		const float fovCheck = read<float>(desc + 40), nearCheck = read<float>(desc + 32), farCheck = read<float>(desc + 36);
 		if (!(fovCheck > 1.0f && fovCheck < 179.0f) || !(nearCheck > 0.0f) || !(farCheck > nearCheck) || !std::isfinite(read<double>(desc + 48)) ||
 			!std::isfinite(read<double>(desc + 56)) || !std::isfinite(read<double>(desc + 64)))
@@ -205,7 +223,9 @@ namespace
 			for (int i = 0; i < 2; ++i)
 				if (!create_layer(dev, g_world[i], w, h, format::r8g8b8a8_unorm) ||
 					!create_layer(dev, g_depth[i], w, h, format::r32_float) ||
-					!create_layer(dev, g_overlay[i], w, h, format::r8g8b8a8_unorm))
+					!create_layer(dev, g_overlay[i], w, h, format::r8g8b8a8_unorm) ||
+					!create_layer(dev, g_avatar[i], w, h, format::r8g8b8a8_unorm) ||
+					!create_layer(dev, g_avatarDepth[i], w, h, format::r32_float))
 				{
 					destroy_layers(dev);
 					return;
@@ -228,17 +248,57 @@ namespace
 			}
 		} release;
 		const int back = 1 - g_front;
-		const uint8_t *base = g_view + kHeader + g_stride * slot;
-		const size_t layer = size_t(w) * h * 4;
-		subresource_data data;
-		data.row_pitch = w * 4;
-		data.slice_pitch = static_cast<uint32_t>(layer);
-		data.data = const_cast<uint8_t *>(base);
-		dev->update_texture_region(data, g_world[back].tex, 0);
-		data.data = const_cast<uint8_t *>(base + layer);
-		dev->update_texture_region(data, g_depth[back].tex, 0);
-		data.data = const_cast<uint8_t *>(base + 2 * layer);
-		dev->update_texture_region(data, g_overlay[back].tex, 0);
+		if (gpuFrame)
+		{
+			// a GPU frame: Minecraft's planes are already in the shared set named here; copy them texture to texture
+			// once Minecraft's GPU has finished them (no CPU readback, no 25 MB copy, no upload)
+			const uint8_t *gpuDesc = g_view + kGpuDesc + 32 * slot;
+			const uint32_t generation = read<uint32_t>(gpuDesc), set = read<uint32_t>(gpuDesc + 4);
+			const uint64_t frame = uint64_t(read<int64_t>(desc + 8));
+			if (!g_gpu.ready(generation, set, w, h, frame))
+				return; // not finished on Minecraft's side yet: next present
+			if (g_copyFence.handle == 0 && !dev->create_fence(0, fence_flags::none, &g_copyFence))
+				return;
+			command_queue *queue = runtime->get_command_queue();
+			command_list *cmd = queue->get_immediate_command_list();
+			if (cmd == nullptr)
+				return;
+			const resource targets[5] = {g_world[back].tex, g_depth[back].tex, g_overlay[back].tex, g_avatar[back].tex, g_avatarDepth[back].tex};
+			const uint32_t planes = avatar ? 5 : 3;
+			for (uint32_t plane = 0; plane < planes; ++plane)
+			{
+				// the shared source is a simultaneous-access texture in COMMON (promoted implicitly): only ours needs barriers
+				cmd->barrier(targets[plane], resource_usage::shader_resource, resource_usage::copy_dest);
+				cmd->copy_texture_region(g_gpu.plane(set, plane), 0, nullptr, targets[plane], 0, nullptr);
+				cmd->barrier(targets[plane], resource_usage::copy_dest, resource_usage::shader_resource);
+			}
+			queue->flush_immediate_command_list();
+			if (!queue->signal(g_copyFence, ++g_copyValue))
+				return;
+			g_gpu.noteCopy(set, frame, g_copyValue); // the set goes back to Minecraft once this copy has completed
+			++g_statGpuFrames;
+		}
+		else
+		{
+			const uint8_t *base = g_view + kHeader + g_stride * slot;
+			const size_t layer = size_t(w) * h * 4;
+			subresource_data data;
+			data.row_pitch = w * 4;
+			data.slice_pitch = static_cast<uint32_t>(layer);
+			data.data = const_cast<uint8_t *>(base);
+			dev->update_texture_region(data, g_world[back].tex, 0);
+			data.data = const_cast<uint8_t *>(base + layer);
+			dev->update_texture_region(data, g_depth[back].tex, 0);
+			data.data = const_cast<uint8_t *>(base + 2 * layer);
+			dev->update_texture_region(data, g_overlay[back].tex, 0);
+			if (avatar)
+			{
+				data.data = const_cast<uint8_t *>(base + 3 * layer);
+				dev->update_texture_region(data, g_avatar[back].tex, 0);
+				data.data = const_cast<uint8_t *>(base + 4 * layer);
+				dev->update_texture_region(data, g_avatarDepth[back].tex, 0);
+			}
+		}
 		if (read<int64_t>(desc) != seq)
 		{
 			++g_statTorn; // Minecraft rewrote the slot mid-copy: the screen keeps the last whole frame
@@ -251,7 +311,8 @@ namespace
 		++g_framesThisSecond;
 		g_mcNear = read<float>(desc + 32);
 		g_mcFar = read<float>(desc + 36);
-		g_mcFlags = read<int32_t>(desc + 44);
+		g_mcFlags = flags;
+		g_mcAvatar = avatar;
 		g_mcPose.fov = read<float>(desc + 40);
 		g_mcPose.yaw = read<float>(desc + 72);
 		g_mcPose.pitch = read<float>(desc + 76);
@@ -343,6 +404,11 @@ namespace
 		runtime->get_screenshot_width_and_height(&bw, &bh);
 		g_bbWidth = bw;
 		g_bbHeight = bh;
+		// GPU frames: answer Minecraft's texture request (D3D12 only), and hand back every set whose copy has completed
+		g_gpu.poll(runtime, GetTickCount64());
+		if (g_copyFence.handle != 0)
+			g_gpu.retire(runtime->get_device()->get_completed_fence_value(g_copyFence));
+		g_gpuActive = g_gpu.active();
 		bool on = g_active && open_mapping();
 		if (on)
 			upload(runtime);
@@ -367,6 +433,8 @@ namespace
 			return;
 		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "McPlanes"); v.handle != 0)
 			runtime->set_uniform_value_float(v, g_mcNear, g_mcFar, float(g_mcFlags));
+		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AvatarReady"); v.handle != 0)
+			runtime->set_uniform_value_bool(v, g_mcAvatar && !g_mcFirstPerson);
 		// a scene's look overrides the preset's light matching and depth bias; the preset's values come back after
 		auto look = [&](const char *name, float want, float &saved) {
 			const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name);
@@ -442,7 +510,8 @@ namespace
 			// Steve moved with GTA's player since Minecraft drew him: his pixels move by that (in Minecraft's camera
 			// space), not with the camera's re-projection, which would leave him behind (and show him twice). Third
 			// person only; a jump of metres is a teleport, not motion.
-			if (host.hasPlayer && g_mcPose.hasPlayer && !g_mcFirstPerson)
+			// (with the avatar layer the world layer has no Steve in it: nothing of it is moved)
+			if (host.hasPlayer && g_mcPose.hasPlayer && !g_mcFirstPerson && !g_mcAvatar)
 			{
 				const double moved[3] = {host.px - g_mcPose.px, host.py - g_mcPose.py, host.pz - g_mcPose.pz};
 				if (moved[0] * moved[0] + moved[1] * moved[1] + moved[2] * moved[2] < 6.0 * 6.0)
@@ -484,6 +553,13 @@ namespace
 
 	void on_destroy_effect_runtime(effect_runtime *runtime)
 	{
+		g_gpu.destroy(runtime);
+		if (g_copyFence.handle != 0)
+		{
+			runtime->get_command_queue()->wait_idle();
+			runtime->get_device()->destroy_fence(g_copyFence);
+			g_copyFence = {0};
+		}
 		destroy_layers(runtime->get_device());
 	}
 }
@@ -578,7 +654,14 @@ namespace compositor
 		s.width = int(g_width);
 		s.height = int(g_height);
 		s.poseLag = g_poseLag;
+		s.gpuFrames = g_gpuActive.load();
+		s.avatarLayer = g_mcAvatar;
 		return s;
+	}
+
+	bool gpu_frames()
+	{
+		return g_gpuActive.load();
 	}
 
 	void set_cursor(float x, float y, bool visible)

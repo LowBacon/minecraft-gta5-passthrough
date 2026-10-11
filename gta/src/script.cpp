@@ -2466,8 +2466,8 @@ namespace
 		char line[6][120];
 		snprintf(line[0], sizeof(line[0]), "MC passthrough %s  link %s (session %d)  GTA %d fps", g_enabled ? "on" : "off (F7)",
 			linked ? "up" : "DOWN", g_ws.generation(), g_gtaFps);
-		snprintf(line[1], sizeof(line[1]), "Minecraft frames %d/s  age %d ms  %dx%d  torn refused %d%s", s.mcFps, s.frameAgeMs, s.width, s.height,
-			s.torn, s.stale ? "  STALE: Minecraft stopped" : "");
+		snprintf(line[1], sizeof(line[1]), "Minecraft frames %d/s (%s%s)  age %d ms  %dx%d  torn refused %d%s", s.mcFps,
+			s.gpuFrames ? "GPU shared" : "CPU copy", s.avatarLayer ? ", avatar layer" : "", s.frameAgeMs, s.width, s.height, s.torn, s.stale ? "  STALE: Minecraft stopped" : "");
 		snprintf(line[2], sizeof(line[2]), "pose lag %s  input %s  flight %s", s.poseLag < 0 ? "slider" : std::to_string(s.poseLag).c_str(),
 			g_mcScreen ? "MINECRAFT SCREEN" : g_mcKeys ? "play (E Q T / X to Minecraft)" : "GTA only",
 			g_drive.on ? "elytra" : g_fly.on ? "creative" : "none");
@@ -2582,12 +2582,16 @@ namespace
 
 		// Minecraft's window = GTA's picture (its real backbuffer, not the monitor), at up to ~1080p worth of
 		// pixels (the effect scales it up; at 5120x1440 a full-size copy would be ~90 MB of readback per frame).
+		// With GPU frames (Enhanced) nothing is copied through the CPU, so Minecraft renders at GTA's full resolution (up
+		// to 4K), crisp; the CPU path stays at ~1080p worth of pixels.
 		int bw = 0, bh = 0;
 		compositor::backbuffer_size(bw, bh);
-		if (bw > 0 && bh > 0 && (bw * 65536 + bh) != g_viewSent)
+		const bool gpuFrames = compositor::gpu_frames();
+		if (bw > 0 && bh > 0 && (bw * 65536 + bh + (gpuFrames ? 1 : 0)) != g_viewSent)
 		{
-			g_viewSent = bw * 65536 + bh;
-			const double scale = std::min(1.0, std::sqrt(kMaxMinecraftPixels / (double(bw) * bh)));
+			g_viewSent = bw * 65536 + bh + (gpuFrames ? 1 : 0);
+			const double budget = gpuFrames ? 3840.0 * 2160.0 : kMaxMinecraftPixels;
+			const double scale = std::min(1.0, std::sqrt(budget / (double(bw) * bh)));
 			sendf("{\"t\":\"view\",\"w\":%d,\"h\":%d}", int(bw * scale + 0.5), int(bh * scale + 0.5));
 		}
 

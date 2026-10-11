@@ -24,6 +24,11 @@ import net.fabricmc.loader.api.FabricLoader;
  * lighting is put on them afterwards (else night darkens them twice)</li>
  * <li>render.overscan = 1.0..1.5: Minecraft renders this much wider a view than the host's (third person), so turning the
  * camera re-projects into picture that's there instead of an empty edge</li>
+ * <li>render.ownSkin = true | false: the player wears the account's own skin (false: classic Steve)</li>
+ * <li>render.nativeBlocks = true | false: the host draws Minecraft's blocks itself, baked into a mesh, with its own camera at
+ * its own frame rate (they never lag, swim or tear when the camera turns); false: blocks are part of the exported picture</li>
+ * <li>render.avatarLayer = true | false: the player (skin, armour, held items) is drawn into a layer of its own that the
+ * host shows as drawn, never re-projected (false: the player is part of the world picture)</li>
  * </ul>
  */
 public final class Config {
@@ -37,6 +42,9 @@ public final class Config {
 	public static volatile boolean alwaysDaylight = true;
 	/** Minecraft's view is this much wider (tan of the half angle) than the host's, third person: margin to re-project into when the camera turns. */
 	public static volatile double overscan = 1.12;
+	public static volatile boolean ownSkin = true;
+	public static volatile boolean avatarLayer = true;
+	public static volatile boolean nativeBlocks = true;
 
 	private static final String HEADER = """
 		Minecraft x GTA V passthrough.
@@ -44,7 +52,10 @@ public final class Config {
 		  clock and weather otherwise (and follows Minecraft's clock whenever the gamerule advance_time is on);
 		  minecraft = GTA always follows Minecraft; off = never.
 		env.hourOffset: GTA's hour at Minecraft tick 0 (Minecraft's sunrise is 6:00).
-		render.alwaysDaylight: Minecraft's blocks are lit as at noon; GTA's own light is put on them by the effect.""";
+		render.alwaysDaylight: Minecraft's blocks are lit as at noon; GTA's own light is put on them by the effect.
+		render.ownSkin: your account's skin (false: classic Steve).
+		render.avatarLayer: you (skin, armour, what you hold) in a layer of your own, shown as drawn (false: part of the world).
+		render.nativeBlocks: GTA draws Minecraft's blocks itself with its own camera, so they never lag or swim (false: part of the picture).""";
 
 	private Config() {
 	}
@@ -67,8 +78,11 @@ public final class Config {
 		weatherBlendSeconds = integer(p, "env.weatherBlendSeconds", weatherBlendSeconds, 0, 120);
 		alwaysDaylight = bool(p, "render.alwaysDaylight", alwaysDaylight);
 		overscan = decimal(p, "render.overscan", overscan, 1.0, 1.5);
-		Passthrough.LOG.info("config: time {}, weather {}, hourOffset {}, blend {} s / {} s, alwaysDaylight {}, overscan {}",
-			time, weather, hourOffset, blendSeconds, weatherBlendSeconds, alwaysDaylight, overscan);
+		ownSkin = bool(p, "render.ownSkin", ownSkin);
+		avatarLayer = bool(p, "render.avatarLayer", avatarLayer);
+		nativeBlocks = bool(p, "render.nativeBlocks", nativeBlocks);
+		Passthrough.LOG.info("config: time {}, weather {}, hourOffset {}, blend {} s / {} s, alwaysDaylight {}, overscan {}, ownSkin {}, avatarLayer {}, nativeBlocks {}",
+			time, weather, hourOffset, blendSeconds, weatherBlendSeconds, alwaysDaylight, overscan, ownSkin, avatarLayer, nativeBlocks);
 
 		// write back what is in effect, so every setting is there to edit
 		Properties out = new Properties();
@@ -79,6 +93,9 @@ public final class Config {
 		out.setProperty("env.weatherBlendSeconds", Integer.toString(weatherBlendSeconds));
 		out.setProperty("render.alwaysDaylight", Boolean.toString(alwaysDaylight));
 		out.setProperty("render.overscan", String.format(Locale.ROOT, "%.2f", overscan));
+		out.setProperty("render.ownSkin", Boolean.toString(ownSkin));
+		out.setProperty("render.avatarLayer", Boolean.toString(avatarLayer));
+		out.setProperty("render.nativeBlocks", Boolean.toString(nativeBlocks));
 		try {
 			Files.createDirectories(file.getParent());
 			try (Writer w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {

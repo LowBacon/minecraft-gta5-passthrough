@@ -2,7 +2,9 @@ package dev.rehan.passthrough.client.mixin;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import dev.rehan.passthrough.Passthrough;
+import dev.rehan.passthrough.client.BlockMeshClient;
 import dev.rehan.passthrough.client.FrameExporter;
+import dev.rehan.passthrough.client.HostAvatarRenderer;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -32,6 +34,13 @@ abstract class GameRendererMixin {
 	)
 	private void passthrough$captureWorld(final CallbackInfo ci) {
 		FrameExporter.captureWorld(this.mainRenderTarget);
+		HostAvatarRenderer.render(this.mainRenderTarget);
+	}
+
+	@Inject(method = "renderLevel", at = @At("HEAD"))
+	private void passthrough$beginFrame(final CallbackInfo ci) {
+		HostAvatarRenderer.beginFrame();
+		BlockMeshClient.resetFrame();
 	}
 
 	@Inject(method = "render", at = @At("TAIL"))
