@@ -20,6 +20,17 @@ sampler sAvatar { Texture = MCAvatarTex; AddressU = CLAMP; AddressV = CLAMP; };
 sampler sAvatarDepth { Texture = MCAvatarDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 // Set by the add-on: the shown frame has the avatar layer (then the world layer has no player in it).
 uniform bool AvatarReady = false;
+// Native blocks (drawn by the add-on with GTA's camera; EldenCraft's design, MIT, Copyright (c) 2026 Adam Grzegorzewski):
+// premultiplied colour and metres along the view, at GTA's resolution. Set by the add-on while the shown frame left its
+// chunks out for exactly that mesh.
+texture McBlockColorTex : MCBLOCKCOLOR;
+texture McBlockDepthTex : MCBLOCKDEPTH;
+sampler sBlockColor { Texture = McBlockColorTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+sampler sBlockDepth { Texture = McBlockDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+uniform bool BlocksReady = false;
+// GTA's depth buffer, as ReShade's generic depth selected it (the add-on's native block pass reads the same binding).
+texture McHostDepthTex : DEPTH;
+sampler sHostDepth { Texture = McHostDepthTex; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 
 // x = near, y = far, z = flags (1: [0,1] depth, 2: rows bottom-up, 4: reversed Z). Set by the add-on.
 uniform float3 McPlanes = float3(0.05, 2048.0, 7.0);
@@ -65,7 +76,7 @@ uniform float BloomThreshold < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_
 uniform float3 Shake = float3(0.0, 0.0, 0.0);
 uniform float PortalWarp = 0.0;
 uniform float Timer < source = "timer"; >;
-uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0GTA depth (1 m bands)\0Minecraft depth (1 m bands)\0Depth difference\0Avatar layer (red: none this frame)\0Avatar depth test (green: shown, red: behind GTA)\0Avatar vs world (blue: avatar nearer, yellow: world nearer)\0"; > = 0;
+uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0GTA depth (1 m bands)\0Minecraft depth (1 m bands)\0Depth difference\0Avatar layer (red: none this frame)\0Avatar depth test (green: shown, red: behind GTA)\0Avatar vs world (blue: avatar nearer, yellow: world nearer)\0Native blocks (red: off this frame)\0"; > = 0;
 uniform bool Reproject < ui_label = "Re-project to GTA's camera"; ui_tooltip = "Rotate Minecraft's (slightly older) frame onto GTA's current camera."; > = true;
 uniform float PosePrediction < ui_type = "drag"; ui_min = -2.0; ui_max = 3.0; ui_step = 0.05; ui_label = "Pose prediction (frames)";
 	ui_tooltip = "Extrapolate GTA's camera rotation by this many frames before re-projecting."; > = 0.0;
@@ -264,7 +275,7 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 	// without re-projection: the same view, scaled into Minecraft's (wider, by any overscan) frame
 	float2 muv = (ouv - 0.5) * (WarpTan.x / max(WarpTan.y, 1e-3)) + 0.5;
 	bool inside = true;
-	const float zh = host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv, 0, 0)).x);
+	const float zh = host_linear(tex2Dlod(sHostDepth, float4(uv, 0, 0)).x);
 	// how far behind GTA's surface Minecraft may still show: more where that surface is seen at a grazing angle
 	const float allow = min(DepthBias + SlopeBias * abs(ddy(zh)), max(MaxBias, DepthBias));
 	float zm = 1e9;
@@ -313,7 +324,6 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 
 	const float visible = zm < zh + allow ? 1.0 : 0.0;
 	const float cover = world.a * visible;
-	const float3 worldLit = relight(world.rgb, world.a, uv, zm) * visible;
 
 	// the player's own layer, as Minecraft drew it: only GTA's current lens is applied (its frame can be wider)
 	float4 avatar = 0.0;
@@ -331,6 +341,19 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 			}
 		}
 	}
+	// native blocks: Minecraft's blocks drawn by the add-on with GTA's own camera for this very frame (premultiplied colour
+	// and metres), already tested against GTA's depth: nothing of them is re-projected
+	float4 block = 0.0;
+	float zb = 1e9;
+	if (BlocksReady)
+	{
+		const float d = tex2Dlod(sBlockDepth, float4(uv, 0, 0)).r;
+		if (d > 0.001)
+		{
+			zb = d;
+			block = tex2Dlod(sBlockColor, float4(uv, 0, 0));
+		}
+	}
 	if (DebugView == 4)
 	{
 		outColor = float4(avatar.a > 0.0 ? avatar.rgb : host * 0.3 + (AvatarReady ? 0.0 : float3(0.4, 0.0, 0.0)), 1.0);
@@ -346,23 +369,28 @@ void PS_Composite(float4 pos : SV_Position, float2 uv : TEXCOORD, out float4 out
 		outColor = float4(avatar.a > 0.0 ? (cover <= 0.0 ? float3(0.5, 0.5, 0.5) : za <= zm ? float3(0.0, 0.3, 1.0) : float3(1.0, 0.9, 0.0)) : host * 0.3, 1.0);
 		return;
 	}
-	const float aCover = za < zh + allow ? avatar.a : 0.0;
-	if (aCover > 0.0)
+	if (DebugView == 7)
 	{
-		const float3 avatarLit = relight(avatar.rgb, avatar.a, uv, za);
-		// nearest first: the player in front of the world, or a block between the camera and the player
-		const float3 c = za <= zm || cover <= 0.0 ? avatarLit + (worldLit + host * (1.0 - cover)) * (1.0 - aCover)
-			: worldLit + (avatarLit + host * (1.0 - aCover)) * (1.0 - cover);
-		const float both = 1.0 - (1.0 - cover) * (1.0 - aCover);
-		outColor = float4(c, 1.0);
-		// w: how much of this is the player (no glow on them: armour and skin aren't lights)
-		outInfo = float4(both, cover > 0.0 ? min(zm, za) : za, zh, za <= zm || cover <= 0.0 ? aCover : 0.0);
+		outColor = float4(block.a > 0.0 ? block.rgb + host * 0.3 * (1.0 - block.a) : host * 0.3 + (BlocksReady ? 0.0 : float3(0.4, 0.0, 0.0)), 1.0);
 		return;
 	}
-	outColor = float4(worldLit + host * (1.0 - cover), 1.0);
-	outInfo = float4(cover, cover > 0.0 ? zm : 0.0, zh, 0.0);
+	const float aCover = za < zh + allow ? avatar.a : 0.0;
+	// three premultiplied layers, nearest first over GTA: blocks, the re-projected world (entities, and the chunks
+	// themselves while native blocks are off) and the player
+	float4 c0 = cover > 0.0 ? float4(relight(world.rgb, world.a, uv, zm) * visible, cover) : 0.0;
+	float4 c1 = block.a > 0.0 ? float4(relight(block.rgb, block.a, uv, zb), block.a) : 0.0;
+	float4 c2 = aCover > 0.0 ? float4(relight(avatar.rgb, avatar.a, uv, za), aCover) : 0.0;
+	float d0 = cover > 0.0 ? zm : 1e9, d1 = block.a > 0.0 ? zb : 1e9, d2 = aCover > 0.0 ? za : 1e9;
+	float p0 = 0.0, p1 = 0.0, p2 = 1.0; // which layer is the player (no glow on them: armour and skin aren't lights)
+	if (d1 < d0) { const float4 c = c0; c0 = c1; c1 = c; const float d = d0; d0 = d1; d1 = d; const float p = p0; p0 = p1; p1 = p; }
+	if (d2 < d1) { const float4 c = c1; c1 = c2; c2 = c; const float d = d1; d1 = d2; d2 = d; const float p = p1; p1 = p2; p2 = p; }
+	if (d1 < d0) { const float4 c = c0; c0 = c1; c1 = c; const float d = d0; d0 = d1; d1 = d; const float p = p0; p0 = p1; p1 = p; }
+	const float3 rgb = c0.rgb + (c1.rgb + (c2.rgb + host * (1.0 - c2.a)) * (1.0 - c1.a)) * (1.0 - c0.a);
+	const float coverAll = 1.0 - (1.0 - c0.a) * (1.0 - c1.a) * (1.0 - c2.a);
+	outColor = float4(rgb, 1.0);
+	// coverage, the nearest Minecraft surface's distance, GTA's, and how much of the nearest is the player
+	outInfo = float4(coverAll, coverAll > 0.0 ? min(d0, 1e8) : 0.0, zh, c0.a > 0.0 ? p0 * c0.a : (c1.a > 0.0 ? p1 * c1.a : p2 * c2.a));
 }
-
 /// Minecraft's bright parts (lava, fire, the portal, blazes): what glows.
 float4 PS_Bright(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {

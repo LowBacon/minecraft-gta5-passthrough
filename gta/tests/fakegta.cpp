@@ -1,10 +1,10 @@
 // A stand-in for GTA V to test the GTA half of the passthrough end to end, before GTA is installed:
-// a D3D11 window that renders a checkerboard ground and a red pillar into a reversed-Z depth buffer (like GTA),
+// a D3D11 (or, with d3d12, a D3D12: GTA V Enhanced's API, GPU-shared frames included) window that renders a checkerboard ground and a red pillar into a reversed-Z depth buffer (like GTA),
 // flies its camera in GTA's conventions (z up, heading 0 = +y) and drives Minecraft with it through the same
 // WebSocket client, while ReShade (dxgi.dll next to the exe) runs MCPassthrough.fx with the compositor add-on
 // compiled in here.
 //
-//   fakegta.exe [seconds] [shake 0/1] [third] [screenshot prefix]
+//   fakegta.exe [seconds] [shake 0/1] [third] [screenshot prefix] [d3d12]
 // third: a stand-in player walks to and fro in third person (the camera behind, turning round them); screenshot prefix:
 // the finished picture (ReShade's, effects included) is saved as <prefix>_<n>.bmp every two seconds from 3 s on.
 #include "../src/compositor.h"
@@ -13,7 +13,10 @@
 #include "../src/ws.h"
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include <wrl/client.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +27,8 @@
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "user32.lib")
 
@@ -142,6 +147,35 @@ float4 ps(VSOut i) : SV_Target
 		float tx = 0, ty = 0, speed = 1;
 	} g_player;
 
+	// This window's depth buffer, bound to ReShade's DEPTH semantic: what ReShade's generic depth add-on does for GTA (it
+	// doesn't pick this stand-in's up; ReShade.ini disables it so it doesn't unbind this). D3D11: our own SRV; D3D12: a view
+	// made through ReShade (its D3D12 views live in its own descriptor heaps). Bound once: binding waits for the GPU.
+	ID3D11ShaderResourceView *g_depthSrv = nullptr;
+	ID3D12Resource *g_depth12 = nullptr;
+	reshade::api::resource_view g_depthView = {0};
+	bool g_depthBound = false;
+
+	void on_begin_effects_depth(reshade::api::effect_runtime *runtime, reshade::api::command_list *, reshade::api::resource_view, reshade::api::resource_view)
+	{
+		if (g_depthBound)
+			return;
+		if (g_depthSrv != nullptr)
+			g_depthView = {reinterpret_cast<uint64_t>(g_depthSrv)};
+		else if (g_depth12 != nullptr && g_depthView.handle == 0 &&
+				 !runtime->get_device()->create_resource_view({reinterpret_cast<uint64_t>(g_depth12)}, reshade::api::resource_usage::shader_resource,
+					 reshade::api::resource_view_desc(reshade::api::format::r32_float), &g_depthView))
+			return;
+		if (g_depthView.handle == 0)
+			return;
+		runtime->update_texture_bindings("DEPTH", g_depthView, g_depthView);
+		g_depthBound = true;
+	}
+
+	void on_reloaded_depth(reshade::api::effect_runtime *)
+	{
+		g_depthBound = false;
+	}
+
 	std::string g_shotPrefix;
 	std::atomic<double> g_now{0.0};
 	double g_nextShot = 3.0;
@@ -233,6 +267,351 @@ float4 ps(VSOut i) : SV_Target
 		}
 		return DefWindowProcW(h, m, w, l);
 	}
+
+
+	using Microsoft::WRL::ComPtr;
+
+	/// The test scene's renderer: draws the scene (ground, pillar, wall, block edges) into a reversed-Z depth buffer.
+	struct Gfx
+	{
+		virtual ~Gfx() = default;
+		virtual bool init(HWND hwnd, const std::vector<Vertex> &verts) = 0;
+		virtual void frame(const Mat &viewProj) = 0; // presents (ReShade's effects run inside)
+	};
+
+	bool compile(const char *entry, const char *target, ComPtr<ID3DBlob> &out)
+	{
+		ComPtr<ID3DBlob> err;
+		if (SUCCEEDED(D3DCompile(kShader, std::strlen(kShader), nullptr, nullptr, nullptr, entry, target, 0, 0, &out, &err)))
+			return true;
+		std::printf("shader: %s\n", err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
+		return false;
+	}
+
+	// HLSL float4x4 is column-major by default: upload the transpose of our row-major matrix
+	Mat transposed(const Mat &m)
+	{
+		Mat t;
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j)
+				t.m[i][j] = m.m[j][i];
+		return t;
+	}
+
+	struct Gfx11 : Gfx
+	{
+		ComPtr<ID3D11Device> dev;
+		ComPtr<ID3D11DeviceContext> ctx;
+		ComPtr<IDXGISwapChain> swap;
+		ComPtr<ID3D11RenderTargetView> rtv;
+		ComPtr<ID3D11DepthStencilView> dsv;
+		ComPtr<ID3D11DepthStencilState> dss;
+		ComPtr<ID3D11RasterizerState> raster;
+		ComPtr<ID3D11VertexShader> vs;
+		ComPtr<ID3D11PixelShader> ps;
+		ComPtr<ID3D11InputLayout> il;
+		ComPtr<ID3D11Buffer> vb, cb;
+		UINT count = 0;
+
+		bool init(HWND hwnd, const std::vector<Vertex> &verts) override
+		{
+			DXGI_SWAP_CHAIN_DESC sd = {};
+			sd.BufferCount = 2;
+			sd.BufferDesc.Width = kWidth;
+			sd.BufferDesc.Height = kHeight;
+			sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			sd.OutputWindow = hwnd;
+			sd.SampleDesc.Count = 1;
+			sd.Windowed = TRUE;
+			sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+			if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &swap, &dev, nullptr, &ctx)))
+				return false;
+			ComPtr<ID3D11Texture2D> back;
+			swap->GetBuffer(0, IID_PPV_ARGS(&back));
+			dev->CreateRenderTargetView(back.Get(), nullptr, &rtv);
+			D3D11_TEXTURE2D_DESC dd = {};
+			dd.Width = kWidth;
+			dd.Height = kHeight;
+			dd.MipLevels = 1;
+			dd.ArraySize = 1;
+			dd.Format = DXGI_FORMAT_R32_TYPELESS;
+			dd.SampleDesc.Count = 1;
+			dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+			ComPtr<ID3D11Texture2D> depth;
+			dev->CreateTexture2D(&dd, nullptr, &depth);
+			D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {};
+			dvd.Format = DXGI_FORMAT_D32_FLOAT;
+			dvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+			dev->CreateDepthStencilView(depth.Get(), &dvd, &dsv);
+			D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
+			svd.Format = DXGI_FORMAT_R32_FLOAT;
+			svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			svd.Texture2D.MipLevels = 1;
+			dev->CreateShaderResourceView(depth.Get(), &svd, &g_depthSrv);
+			D3D11_DEPTH_STENCIL_DESC dsd = {};
+			dsd.DepthEnable = TRUE;
+			dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+			dsd.DepthFunc = D3D11_COMPARISON_GREATER; // reversed Z
+			dev->CreateDepthStencilState(&dsd, &dss);
+			D3D11_RASTERIZER_DESC rasterDesc = {};
+			rasterDesc.FillMode = D3D11_FILL_SOLID;
+			rasterDesc.CullMode = D3D11_CULL_NONE;
+			rasterDesc.DepthClipEnable = TRUE;
+			dev->CreateRasterizerState(&rasterDesc, &raster);
+			ComPtr<ID3DBlob> vsb, psb;
+			if (!compile("vs", "vs_5_0", vsb) || !compile("ps", "ps_5_0", psb))
+				return false;
+			dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
+			dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
+			const D3D11_INPUT_ELEMENT_DESC layout[] = {
+				{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+				{"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+				{"CHECKER", 0, DXGI_FORMAT_R32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			};
+			dev->CreateInputLayout(layout, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &il);
+			D3D11_BUFFER_DESC bd = {};
+			bd.ByteWidth = UINT(verts.size() * sizeof(Vertex));
+			bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+			D3D11_SUBRESOURCE_DATA init = {verts.data()};
+			dev->CreateBuffer(&bd, &init, &vb);
+			D3D11_BUFFER_DESC cbd = {};
+			cbd.ByteWidth = sizeof(Mat);
+			cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			cbd.Usage = D3D11_USAGE_DYNAMIC;
+			cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			dev->CreateBuffer(&cbd, nullptr, &cb);
+			count = UINT(verts.size());
+			return true;
+		}
+
+		void frame(const Mat &viewProj) override
+		{
+			D3D11_MAPPED_SUBRESOURCE mapped;
+			ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+			const Mat tr = transposed(viewProj);
+			std::memcpy(mapped.pData, &tr, sizeof(Mat));
+			ctx->Unmap(cb.Get(), 0);
+			const float sky[4] = {0.55f, 0.7f, 0.92f, 1.0f};
+			ctx->ClearRenderTargetView(rtv.Get(), sky);
+			ctx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+			ID3D11RenderTargetView *target = rtv.Get();
+			ctx->OMSetRenderTargets(1, &target, dsv.Get());
+			ctx->OMSetDepthStencilState(dss.Get(), 0);
+			ctx->RSSetState(raster.Get());
+			D3D11_VIEWPORT vpd = {0, 0, float(kWidth), float(kHeight), 0, 1};
+			ctx->RSSetViewports(1, &vpd);
+			const UINT stride = sizeof(Vertex), offset = 0;
+			ID3D11Buffer *vertexBuffer = vb.Get(), *constants = cb.Get();
+			ctx->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+			ctx->IASetInputLayout(il.Get());
+			ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			ctx->VSSetShader(vs.Get(), nullptr, 0);
+			ctx->VSSetConstantBuffers(0, 1, &constants);
+			ctx->PSSetShader(ps.Get(), nullptr, 0);
+			ctx->Draw(count, 0);
+			swap->Present(1, 0);
+		}
+	};
+
+	/// GTA V Enhanced's API: a flip-model D3D12 swap chain, so ReShade runs its D3D12 runtime (and the add-on its GPU frames).
+	struct Gfx12 : Gfx
+	{
+		ComPtr<ID3D12Device> dev;
+		ComPtr<ID3D12CommandQueue> queue;
+		ComPtr<IDXGISwapChain3> swap;
+		ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
+		UINT rtvStride = 0;
+		ComPtr<ID3D12Resource> back[2], depth, vb;
+		ComPtr<ID3D12CommandAllocator> alloc;
+		ComPtr<ID3D12GraphicsCommandList> list;
+		ComPtr<ID3D12RootSignature> root;
+		ComPtr<ID3D12PipelineState> pso;
+		ComPtr<ID3D12Fence> fence;
+		UINT64 fenceValue = 0;
+		HANDLE event = nullptr;
+		D3D12_VERTEX_BUFFER_VIEW vbv = {};
+		UINT count = 0;
+		bool depthReadable = false;
+
+		static D3D12_RESOURCE_BARRIER transition(ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+		{
+			D3D12_RESOURCE_BARRIER b = {};
+			b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b.Transition.pResource = r;
+			b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b.Transition.StateBefore = from;
+			b.Transition.StateAfter = to;
+			return b;
+		}
+
+		bool init(HWND hwnd, const std::vector<Vertex> &verts) override
+		{
+			if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))))
+				return false;
+			D3D12_COMMAND_QUEUE_DESC qd = {};
+			qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+			if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))))
+				return false;
+			ComPtr<IDXGIFactory2> factory;
+			if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
+				return false;
+			DXGI_SWAP_CHAIN_DESC1 sd = {};
+			sd.Width = kWidth;
+			sd.Height = kHeight;
+			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sd.SampleDesc.Count = 1;
+			sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			sd.BufferCount = 2;
+			sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+			ComPtr<IDXGISwapChain1> swap1;
+			if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &sd, nullptr, nullptr, &swap1)) || FAILED(swap1.As(&swap)))
+				return false;
+			D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+			hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			hd.NumDescriptors = 2;
+			dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap));
+			hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+			hd.NumDescriptors = 1;
+			dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvHeap));
+			rtvStride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+			for (UINT i = 0; i < 2; ++i)
+			{
+				swap->GetBuffer(i, IID_PPV_ARGS(&back[i]));
+				D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+				h.ptr += i * rtvStride;
+				dev->CreateRenderTargetView(back[i].Get(), nullptr, h);
+			}
+			D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+			D3D12_RESOURCE_DESC dd = {};
+			dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			dd.Width = kWidth;
+			dd.Height = kHeight;
+			dd.DepthOrArraySize = 1;
+			dd.MipLevels = 1;
+			dd.Format = DXGI_FORMAT_R32_TYPELESS;
+			dd.SampleDesc.Count = 1;
+			dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+			D3D12_CLEAR_VALUE clear = {};
+			clear.Format = DXGI_FORMAT_D32_FLOAT;
+			clear.DepthStencil.Depth = 0.0f;
+			if (FAILED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth))))
+				return false;
+			D3D12_DEPTH_STENCIL_VIEW_DESC dvd = {};
+			dvd.Format = DXGI_FORMAT_D32_FLOAT;
+			dvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+			dev->CreateDepthStencilView(depth.Get(), &dvd, dsvHeap->GetCPUDescriptorHandleForHeapStart());
+			g_depth12 = depth.Get();
+			// one root parameter: the view-projection matrix as 16 root constants (b0)
+			D3D12_ROOT_PARAMETER param = {};
+			param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			param.Constants.Num32BitValues = 16;
+			param.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+			D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+			rootDesc.NumParameters = 1;
+			rootDesc.pParameters = &param;
+			rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+			ComPtr<ID3DBlob> sig, err;
+			if (FAILED(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+				FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root))))
+				return false;
+			ComPtr<ID3DBlob> vsb, psb;
+			if (!compile("vs", "vs_5_0", vsb) || !compile("ps", "ps_5_0", psb))
+				return false;
+			const D3D12_INPUT_ELEMENT_DESC layout[] = {
+				{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+				{"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+				{"CHECKER", 0, DXGI_FORMAT_R32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+			};
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+			pd.pRootSignature = root.Get();
+			pd.VS = {vsb->GetBufferPointer(), vsb->GetBufferSize()};
+			pd.PS = {psb->GetBufferPointer(), psb->GetBufferSize()};
+			pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			pd.SampleMask = UINT_MAX;
+			pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+			pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			pd.RasterizerState.DepthClipEnable = TRUE;
+			pd.DepthStencilState.DepthEnable = TRUE;
+			pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+			pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER; // reversed Z
+			pd.InputLayout = {layout, 3};
+			pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			pd.NumRenderTargets = 1;
+			pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+			pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+			pd.SampleDesc.Count = 1;
+			if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso))))
+				return false;
+			D3D12_HEAP_PROPERTIES upload = {D3D12_HEAP_TYPE_UPLOAD};
+			D3D12_RESOURCE_DESC bd = {};
+			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bd.Width = verts.size() * sizeof(Vertex);
+			bd.Height = 1;
+			bd.DepthOrArraySize = 1;
+			bd.MipLevels = 1;
+			bd.SampleDesc.Count = 1;
+			bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			if (FAILED(dev->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vb))))
+				return false;
+			void *mapped = nullptr;
+			vb->Map(0, nullptr, &mapped);
+			std::memcpy(mapped, verts.data(), bd.Width);
+			vb->Unmap(0, nullptr);
+			vbv = {vb->GetGPUVirtualAddress(), UINT(bd.Width), sizeof(Vertex)};
+			count = UINT(verts.size());
+			dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+			dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), pso.Get(), IID_PPV_ARGS(&list));
+			list->Close();
+			dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+			event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			return true;
+		}
+
+		void frame(const Mat &viewProj) override
+		{
+			const UINT index = swap->GetCurrentBackBufferIndex();
+			alloc->Reset();
+			list->Reset(alloc.Get(), pso.Get());
+			const D3D12_RESOURCE_STATES readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			D3D12_RESOURCE_BARRIER begin[2] = {transition(back[index].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
+				transition(depth.Get(), readable, D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+			list->ResourceBarrier(depthReadable ? 2 : 1, begin);
+			D3D12_CPU_DESCRIPTOR_HANDLE target = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+			target.ptr += index * rtvStride;
+			const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+			const float sky[4] = {0.55f, 0.7f, 0.92f, 1.0f};
+			list->ClearRenderTargetView(target, sky, 0, nullptr);
+			list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+			list->OMSetRenderTargets(1, &target, FALSE, &dsv);
+			const D3D12_VIEWPORT viewport = {0, 0, float(kWidth), float(kHeight), 0, 1};
+			const D3D12_RECT scissor = {0, 0, kWidth, kHeight};
+			list->RSSetViewports(1, &viewport);
+			list->RSSetScissorRects(1, &scissor);
+			list->SetGraphicsRootSignature(root.Get());
+			const Mat tr = transposed(viewProj);
+			list->SetGraphicsRoot32BitConstants(0, 16, &tr, 0);
+			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			list->IASetVertexBuffers(0, 1, &vbv);
+			list->DrawInstanced(count, 1, 0, 0);
+			// the depth stays readable through Present, for ReShade and the add-on's block pass
+			D3D12_RESOURCE_BARRIER end[2] = {transition(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, readable),
+				transition(back[index].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)};
+			list->ResourceBarrier(2, end);
+			depthReadable = true;
+			list->Close();
+			ID3D12CommandList *lists[] = {list.Get()};
+			queue->ExecuteCommandLists(1, lists);
+			swap->Present(1, 0);
+			// the simplest pacing: the GPU finishes each frame before the next one is recorded
+			queue->Signal(fence.Get(), ++fenceValue);
+			if (fence->GetCompletedValue() < fenceValue)
+			{
+				fence->SetEventOnCompletion(fenceValue, event);
+				WaitForSingleObject(event, 5000);
+			}
+		}
+	};
 }
 
 int main(int argc, char **argv)
@@ -242,6 +621,7 @@ int main(int argc, char **argv)
 	const bool third = argc > 3 && std::strcmp(argv[3], "third") == 0;
 	if (argc > 4)
 		g_shotPrefix = argv[4];
+	const bool d3d12 = argc > 5 && std::strcmp(argv[5], "d3d12") == 0;
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = wndproc;
 	wc.hInstance = GetModuleHandleW(nullptr);
@@ -251,76 +631,6 @@ int main(int argc, char **argv)
 	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 	HWND hwnd = CreateWindowW(L"FakeGTA", L"Fake GTA (passthrough test)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40,
 		rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
-
-	DXGI_SWAP_CHAIN_DESC sd = {};
-	sd.BufferCount = 2;
-	sd.BufferDesc.Width = kWidth;
-	sd.BufferDesc.Height = kHeight;
-	sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	sd.OutputWindow = hwnd;
-	sd.SampleDesc.Count = 1;
-	sd.Windowed = TRUE;
-	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	ID3D11Device *dev = nullptr;
-	ID3D11DeviceContext *ctx = nullptr;
-	IDXGISwapChain *swap = nullptr;
-	if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &swap, &dev, nullptr, &ctx)))
-	{
-		std::puts("D3D11 init failed");
-		return 1;
-	}
-	std::printf("compositor registered with ReShade: %s\n", compositor::try_register(GetModuleHandleW(nullptr)) ? "yes" : "no (is dxgi.dll ReShade?)");
-	if (!g_shotPrefix.empty())
-		reshade::register_event<reshade::addon_event::reshade_present>(on_present_shot);
-
-	ID3D11Texture2D *back = nullptr;
-	swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back));
-	ID3D11RenderTargetView *rtv = nullptr;
-	dev->CreateRenderTargetView(back, nullptr, &rtv);
-	D3D11_TEXTURE2D_DESC dd = {};
-	dd.Width = kWidth;
-	dd.Height = kHeight;
-	dd.MipLevels = 1;
-	dd.ArraySize = 1;
-	dd.Format = DXGI_FORMAT_D32_FLOAT;
-	dd.SampleDesc.Count = 1;
-	dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-	ID3D11Texture2D *depth = nullptr;
-	dev->CreateTexture2D(&dd, nullptr, &depth);
-	ID3D11DepthStencilView *dsv = nullptr;
-	dev->CreateDepthStencilView(depth, nullptr, &dsv);
-	D3D11_DEPTH_STENCIL_DESC dsd = {};
-	dsd.DepthEnable = TRUE;
-	dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-	dsd.DepthFunc = D3D11_COMPARISON_GREATER; // reversed Z
-	ID3D11DepthStencilState *dss = nullptr;
-	dev->CreateDepthStencilState(&dsd, &dss);
-	D3D11_RASTERIZER_DESC rd = {};
-	rd.FillMode = D3D11_FILL_SOLID;
-	rd.CullMode = D3D11_CULL_NONE;
-	rd.DepthClipEnable = TRUE;
-	ID3D11RasterizerState *rs = nullptr;
-	dev->CreateRasterizerState(&rd, &rs);
-
-	ID3DBlob *vsb = nullptr, *psb = nullptr, *err = nullptr;
-	if (FAILED(D3DCompile(kShader, std::strlen(kShader), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsb, &err)) ||
-		FAILED(D3DCompile(kShader, std::strlen(kShader), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psb, &err)))
-	{
-		std::printf("shader: %s\n", err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
-		return 1;
-	}
-	ID3D11VertexShader *vs = nullptr;
-	ID3D11PixelShader *ps = nullptr;
-	dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
-	dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
-	const D3D11_INPUT_ELEMENT_DESC layout[] = {
-		{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-		{"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-		{"CHECKER", 0, DXGI_FORMAT_R32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
-	};
-	ID3D11InputLayout *il = nullptr;
-	dev->CreateInputLayout(layout, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &il);
 
 	// The scene, in GTA coordinates: ground at kGroundZ, a red pillar, a blue slab near the Minecraft blocks.
 	std::vector<Vertex> verts;
@@ -333,19 +643,21 @@ int main(int argc, char **argv)
 	// where the Minecraft blocks are: the diamond pillar (0, 64..66, 6) and the TNT (2, 64, 6); MC z -> GTA -y
 	add_edges(verts, 0, -7, kGroundZ, 1, -6, kGroundZ + 3);
 	add_edges(verts, 2, -7, kGroundZ, 3, -6, kGroundZ + 1);
-	D3D11_BUFFER_DESC bd = {};
-	bd.ByteWidth = UINT(verts.size() * sizeof(Vertex));
-	bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-	D3D11_SUBRESOURCE_DATA init = {verts.data()};
-	ID3D11Buffer *vb = nullptr;
-	dev->CreateBuffer(&bd, &init, &vb);
-	D3D11_BUFFER_DESC cbd = {};
-	cbd.ByteWidth = sizeof(Mat);
-	cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	cbd.Usage = D3D11_USAGE_DYNAMIC;
-	cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	ID3D11Buffer *cb = nullptr;
-	dev->CreateBuffer(&cbd, nullptr, &cb);
+
+	Gfx11 gfx11;
+	Gfx12 gfx12;
+	Gfx &gfx = d3d12 ? static_cast<Gfx &>(gfx12) : static_cast<Gfx &>(gfx11);
+	if (!gfx.init(hwnd, verts))
+	{
+		std::printf("%s init failed\n", d3d12 ? "D3D12" : "D3D11");
+		return 1;
+	}
+	std::printf("%s; compositor registered with ReShade: %s\n", d3d12 ? "D3D12" : "D3D11",
+		compositor::try_register(GetModuleHandleW(nullptr)) ? "yes" : "no (is dxgi.dll ReShade?)");
+	if (!g_shotPrefix.empty())
+		reshade::register_event<reshade::addon_event::reshade_present>(on_present_shot);
+	reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects_depth);
+	reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_depth);
 
 	WsClient ws;
 	ws.start("127.0.0.1", 25599);
@@ -426,6 +738,8 @@ int main(int argc, char **argv)
 				char v[128];
 				snprintf(v, sizeof(v), "{\"t\":\"view\",\"w\":%d,\"h\":%d}", kWidth, kHeight);
 				ws.send(v);
+				snprintf(v, sizeof(v), "{\"t\":\"host\",\"pid\":%lu}", GetCurrentProcessId());
+				ws.send(v);
 				std::string cols;
 				for (int x = -30; x <= 30; ++x)
 					for (int z = -30; z <= 30; ++z)
@@ -460,34 +774,7 @@ int main(int argc, char **argv)
 			}
 		}
 
-		const Mat vp = view_proj(eye, pitch, yaw, kFov, float(kWidth) / kHeight);
-		D3D11_MAPPED_SUBRESOURCE mapped;
-		ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-		// HLSL float4x4 in a cbuffer is column-major by default: upload the transpose of our row-major matrix
-		Mat tr;
-		for (int i = 0; i < 4; ++i)
-			for (int j = 0; j < 4; ++j)
-				tr.m[i][j] = vp.m[j][i];
-		std::memcpy(mapped.pData, &tr, sizeof(Mat));
-		ctx->Unmap(cb, 0);
-
-		const float sky[4] = {0.55f, 0.7f, 0.92f, 1.0f};
-		ctx->ClearRenderTargetView(rtv, sky);
-		ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
-		ctx->OMSetRenderTargets(1, &rtv, dsv);
-		ctx->OMSetDepthStencilState(dss, 0);
-		ctx->RSSetState(rs);
-		D3D11_VIEWPORT vpd = {0, 0, float(kWidth), float(kHeight), 0, 1};
-		ctx->RSSetViewports(1, &vpd);
-		const UINT stride = sizeof(Vertex), offset = 0;
-		ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-		ctx->IASetInputLayout(il);
-		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		ctx->VSSetShader(vs, nullptr, 0);
-		ctx->VSSetConstantBuffers(0, 1, &cb);
-		ctx->PSSetShader(ps, nullptr, 0);
-		ctx->Draw(UINT(verts.size()), 0);
-		swap->Present(1, 0);
+		gfx.frame(view_proj(eye, pitch, yaw, kFov, float(kWidth) / kHeight));
 	}
 	ws.stop();
 	return 0;

@@ -2463,11 +2463,11 @@ namespace
 			return;
 		const compositor::Stats s = compositor::stats();
 		const bool linked = g_ws.connected();
-		char line[6][120];
+		char line[6][160];
 		snprintf(line[0], sizeof(line[0]), "MC passthrough %s  link %s (session %d)  GTA %d fps", g_enabled ? "on" : "off (F7)",
 			linked ? "up" : "DOWN", g_ws.generation(), g_gtaFps);
-		snprintf(line[1], sizeof(line[1]), "Minecraft frames %d/s (%s%s)  age %d ms  %dx%d  torn refused %d%s", s.mcFps,
-			s.gpuFrames ? "GPU shared" : "CPU copy", s.avatarLayer ? ", avatar layer" : "", s.frameAgeMs, s.width, s.height, s.torn, s.stale ? "  STALE: Minecraft stopped" : "");
+		snprintf(line[1], sizeof(line[1]), "Minecraft frames %d/s (%s%s%s)  age %d ms  %dx%d  torn refused %d%s", s.mcFps,
+			s.gpuFrames ? "GPU shared" : "CPU copy", s.avatarLayer ? ", avatar layer" : "", s.nativeBlocks ? ", native blocks" : "", s.frameAgeMs, s.width, s.height, s.torn, s.stale ? "  STALE: Minecraft stopped" : "");
 		snprintf(line[2], sizeof(line[2]), "pose lag %s  input %s  flight %s", s.poseLag < 0 ? "slider" : std::to_string(s.poseLag).c_str(),
 			g_mcScreen ? "MINECRAFT SCREEN" : g_mcKeys ? "play (E Q T / X to Minecraft)" : "GTA only",
 			g_drive.on ? "elytra" : g_fly.on ? "creative" : "none");
@@ -2539,6 +2539,8 @@ namespace
 			g_haveOffset = false;
 			g_viewSent = 0;
 			natives::Notify("Minecraft passthrough ~g~connected");
+			// which process this is: Minecraft publishes its native block mesh for it
+			sendf("{\"t\":\"host\",\"pid\":%lu}", GetCurrentProcessId());
 			make_safe(ped);
 			mobwar_clear_all();
 			g_hot.clear();

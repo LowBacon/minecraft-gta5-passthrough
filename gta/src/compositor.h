@@ -39,7 +39,8 @@ namespace compositor
 	struct Stats
 	{
 		int mcFps = 0, frameAgeMs = -1, torn = 0, width = 0, height = 0, poseLag = -1;
-		bool stale = false, gpuFrames = false, avatarLayer = false;
+		bool stale = false, gpuFrames = false, avatarLayer = false, nativeBlocks = false;
+		int blockVertices = 0;
 	};
 	Stats stats();
 	/// Minecraft's frames come as shared GPU textures (GTA V Enhanced, D3D12): no CPU copy, so full resolution is free.

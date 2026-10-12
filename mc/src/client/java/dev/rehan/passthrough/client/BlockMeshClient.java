@@ -287,8 +287,10 @@ public final class BlockMeshClient {
 		try {
 			Minecraft client = Minecraft.getInstance();
 			if (!enabled() || client.level == null) {
-				if (initialized) {
-					reportFallback("native blocks inactive (no host, or render.nativeBlocks=false)");
+				// quiet while no host is attached; otherwise say why
+				if (initialized && Passthrough.active) {
+					reportFallback(HostState.hostPid() == 0 ? "the host didn't say which process it is (an older GTA side)"
+						: !Config.nativeBlocks ? "render.nativeBlocks=false" : "-Dpassthrough.noNativeBlocks or no world");
 				}
 
 				pause();
