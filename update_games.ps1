@@ -32,7 +32,7 @@ $version = (Select-String -Path (Join-Path $here 'mc\gradle.properties') -Patter
 $jar = Join-Path $here "mc\build\libs\passthrough-$version.jar"
 $asi = Join-Path $here 'gta\build\MCPassthrough.asi'
 $fx = Join-Path $here 'gta\shaders\MCPassthrough.fx'
-foreach ($need in $jar, $asi, $fx) { if (-not (Test-Path $need)) { Log "STOP: $need is missing: build first (mc\gradlew.bat build, gta\build.bat)"; exit 1 } }
+foreach ($need in $jar, $asi, $fx) { if (-not (Test-Path $need)) { Log "STOP: $need is missing: build first (mc\gradlew.bat -p mc build, gta\build.bat)"; exit 1 } }
 
 # where the GTA files go (install.ps1 decides the same way)
 $gtaDir = (& (Join-Path $here 'gta\install.ps1') -Edition $Edition -WhereOnly)

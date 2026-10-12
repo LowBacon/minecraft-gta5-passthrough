@@ -1,4 +1,4 @@
-# Frame test against the DEV client only (mc\gradlew.bat runClient): it builds test blocks with commands.
+# Frame test against the DEV client only (mc\gradlew.bat -p mc runClient): it builds test blocks with commands.
 # Plays the host (camera poses at 30 Hz, spinning `-Spin` degrees a second round a fixed spot inside a ring of stone with
 # a glass pane), and reads Minecraft's exported frames from the shared memory: for each, how many pixels Minecraft drew
 # geometry at (depth set) and how many of those aren't fully opaque (alpha < 250: before the fade-in fix, chunk

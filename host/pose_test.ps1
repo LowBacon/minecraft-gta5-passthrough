@@ -1,4 +1,4 @@
-# Steve's poses, against the DEV client only (mc\gradlew.bat runClient): plays the host with a third-person camera on
+# Steve's poses, against the DEV client only (mc\gradlew.bat -p mc runClient): plays the host with a third-person camera on
 # Steve and sends each movement state the GTA plugin sends ("mv": 0 standing, 1 sprint, 2 crouch, 4 swim, 16 seated),
 # saving Minecraft's exported layers for each as PNGs in -Out (look at them: one whole Steve, in that pose). With the
 # avatar layer (slot flag 32) the player is in layer 3, not the world: *_avatar.png is that layer, *_world.png has no Steve.
