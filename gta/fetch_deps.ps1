@@ -1,4 +1,4 @@
-# Fetch what the GTA side needs into third_party\, from Windows PowerShell (fetch_deps.sh does the same from WSL).
+# Fetch what the GTA side needs into third_party\, from Windows PowerShell.
 # None of it may be redistributed here, so it isn't in the repo:
 #   shv\       ScriptHookV SDK: main.h, nativeCaller.h, types.h, ScriptHookV.lib (dev-c.com)
 #   reshade\   ReShade's add-on API headers (crosire/reshade at v6.8.0)

@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <vector>
@@ -41,12 +42,12 @@ namespace mcpt::blocks
 				d->destroy_resource_view(r);
 			r = {};
 		}
-		bool upload_bytes(device *d, resource r, std::span<const std::uint8_t> bytes)
+		bool upload_bytes(device *d, resource r, std::span<const std::uint8_t> bytes, map_access access = map_access::write_only)
 		{
 			if (bytes.empty())
 				return true;
 			void *mapped = nullptr;
-			if (!d->map_buffer_region(r, 0, bytes.size(), map_access::write_only, &mapped))
+			if (!d->map_buffer_region(r, 0, bytes.size(), access, &mapped))
 				return false;
 			std::memcpy(mapped, bytes.data(), bytes.size());
 			d->unmap_buffer_region(r);
@@ -643,21 +644,23 @@ namespace mcpt::blocks
 			m.forward = camera.forward;
 			if (mesh.count)
 			{
-				// D3D12: the static mesh is staged once into GPU memory; the small, changing details stay in an upload buffer
-				const bool upload_heap = s.details && s.d3d12;
+				// the static mesh is staged once into GPU memory; the small details change every frame and stay in a CPU-written
+				// buffer (D3D11: a dynamic one, rewritten whole with discard; a partial UpdateSubresource of it crashed the driver)
+				const bool upload_heap = s.details;
 				if (!m.vertices.handle || m.capacity < vertices.size())
 				{
 					release(d, m.vertices);
 					m.capacity = 0;
 					const auto capacity = s.details ? std::uint64_t(16380) * vertex_stride : std::uint64_t(vertices.size());
 					if (!d->create_resource(resource_desc(capacity, upload_heap ? memory_heap::upload : memory_heap::default_,
-							upload_heap ? resource_usage::vertex_buffer : resource_usage::vertex_buffer | resource_usage::copy_dest), nullptr,
+							upload_heap ? resource_usage::vertex_buffer : resource_usage::vertex_buffer | resource_usage::copy_dest,
+							upload_heap && !s.d3d12 ? resource_flags::dynamic : resource_flags::none), nullptr,
 							upload_heap ? resource_usage::cpu_access : resource_usage::vertex_buffer, &m.vertices))
 						return s.reject("create vertex buffer");
 					m.capacity = capacity;
 				}
 				const auto index_bytes = std::uint64_t(m.sorted.size()) * 4;
-				if (index_bytes && (!m.indices.handle || m.index_capacity < index_bytes))
+				if (index_bytes && (!m.indices.handle || m.index_capacity < index_bytes || (!s.d3d12 && m.index_capacity != index_bytes)))
 				{
 					release(d, m.indices);
 					m.index_capacity = 0;
@@ -668,7 +671,9 @@ namespace mcpt::blocks
 				}
 				if (!s.d3d12)
 				{
-					d->update_buffer_region(vertices.data(), m.vertices, 0, vertices.size());
+					if (upload_heap ? !upload_bytes(d, m.vertices, vertices, map_access::write_discard)
+									: (d->update_buffer_region(vertices.data(), m.vertices, 0, vertices.size()), false))
+						return s.reject("map detail vertex buffer");
 					if (index_bytes)
 						d->update_buffer_region(m.sorted.data(), m.indices, 0, index_bytes);
 					if (!s.signal(runtime, m.completion))

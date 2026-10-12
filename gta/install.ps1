@@ -1,6 +1,5 @@
-# Install the passthrough into GTA V (story mode), Legacy or Enhanced, from Windows PowerShell (install.sh does the
-# same from WSL): ScriptHookV + its ASI loader, MCPassthrough.asi, and ReShade with MCPassthrough.fx. Only adds files;
-# -Remove deletes exactly those.
+# Install the passthrough into GTA V (story mode), Legacy or Enhanced, from Windows PowerShell: ScriptHookV + its ASI
+# loader, MCPassthrough.asi, and ReShade with MCPassthrough.fx. Only adds files; -Remove deletes exactly those.
 #   Legacy (GTA5.exe):            ASI loader dinput8.dll; ReShade as ReShade64.asi (Legacy loads the system dxgi.dll
 #                                 ahead of one in its folder, so the ASI loader loads ReShade instead)
 #   Enhanced (GTA5_Enhanced.exe): ASI loader xinput1_4.dll; ReShade as dxgi.dll (DirectX 12; Enhanced does load it)

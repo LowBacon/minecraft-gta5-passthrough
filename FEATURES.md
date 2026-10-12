@@ -21,6 +21,8 @@ says how each row was checked:
 | Minecraft's real renderer: blocks, block entities, entities, Steve, items, particles, water, glass, signs | Native | Minecraft draws its own frame with its own renderers and models. Nothing is rebuilt as GTA geometry. | in game |
 | Depth against GTA's world | Synchronized | Minecraft's depth (float32, reversed Z) and GTA's (reversed Z) are both turned into metres, and Minecraft shows only where it is nearer. | in game |
 | Re-projection to GTA's current camera | Synchronized | A ray march with bisection and a thickness test, so there's no smear behind thin things. With the avatar layer the world layer has no Steve in it, so nothing of it moves with the player. | in game (smear) |
+| Native blocks (EldenCraft's design, ported) | Synchronized | Minecraft bakes every real block in its render area with vanilla's own renderers (`ModelBlockRenderer`, `FluidRenderer`: AO, biome tint, every model, water and lava) into one mesh, and publishes it with the block atlas (all mip levels), the lightmap and the current frame of every animated sprite (`BlockMeshClient`, mappings `Local\MCPassthroughBlock*`). The GTA add-on uploads it once per revision and draws it every frame with the camera of the GTA frame being presented, tested against GTA's depth, translucent faces sorted back to front (`gta/src/blocks/`). Once GTA acknowledges a revision covering the whole vanilla view, Minecraft leaves its chunks out of the exported picture and every frame names that revision, so a block is never drawn twice or not at all; a change left undisplayed for 1 s, a teleport beyond the prebuilt border or a lost link brings the chunks back. Blocks therefore never lag, swim, smear or show holes when the camera turns: they're drawn like GTA's own geometry. Mining cracks and the selection outline go native too (`BlockDetails`). Edits rebuild only the changed sections (2 ms a frame). The host's barrier ground isn't part of it. `render.nativeBlocks=false` (or `-Dpassthrough.noNativeBlocks=true`) keeps the old picture path. F10 says "native blocks"; DebugView 7 shows the native layer alone. Works on D3D12 (Enhanced) and D3D11 (Legacy). | dev client: `fakegta.exe ... d3d12` and D3D11 composites, blocks locked inside the stand-in's own block outlines through fast camera swings; in game pending |
+| No GPU stall per Minecraft frame | Synchronized (fixed) | ReShade 6.8's `update_texture_bindings` waits for the whole GPU to go idle. The add-on rebound its five layers for every Minecraft frame (it flipped between two texture sets), stalling GTA each time. Now one set stays bound, and each frame reaches it by a GPU copy queued ahead of the effects, only once it's known whole (GPU frames: from the shared set; slot frames: from staging textures on D3D11, from an upload ring on D3D12, never a synchronous upload). | dev client (both APIs) |
 | Steve in a layer of his own (adapted from EldenCraft) | Synchronized | Third person: the world pass leaves the local player out (`AvatarLayerMixin`). `HostAvatarRenderer` then draws them alone with vanilla's own renderer (skin, armour, cape, held items, every pose) into cleared colour and depth, with the world pass's camera and lens. That goes out as layers 3 and 4 (slot flag 32: GPU planes 3 and 4, or slot layers 3 and 4 on the readback path). The effect shows that layer as drawn, camera-relative: GTA's current lens only, never re-projected. It is depth-tested against GTA and against the world layer (a block between the camera and Steve hides him), relit like the world, and kept out of the glow. That is what fixes the head tearing apart and the doubled Steves: before, Steve was cut out of the world picture with a 1.84 m box, so his head, helmet and hat stuck out of it and were left behind. If the layer can't be captured, the frame is dropped, never shown without him. An add-on with only three GPU planes, or `render.avatarLayer=false`, keeps the old path. | dev client: `host/pose_test.ps1` (every pose whole, 100% opaque), `gpu_frames_test.exe` PASS with 5 planes (941 of 941 frames carry him) and with 3 (none, Steve stays in the world), `fakegta.exe 12 0 third` composites checked; in game pending |
 | Your own skin and armour | Synchronized | `render.ownSkin=true` (the default): the account's skin, as in EldenCraft. `false` or `-Dpassthrough.classicSteve=true` brings back classic Steve. Armour, elytra, cape and held items come with the avatar layer. | dev client |
 | Pose lag: which of GTA's cameras the shown picture used | Synchronized | F9 (0 to 3), or the ReShade slider. Enhanced starts at 1. | built |
@@ -111,6 +113,9 @@ env.blendSeconds=3           # time blend
 env.weatherBlendSeconds=15   # weather blend
 render.alwaysDaylight=true
 render.overscan=1.12         # 1.0..1.5: how much wider Minecraft's view is than GTA's (third person)
+render.ownSkin=true          # your own skin (false: classic Steve)
+render.avatarLayer=true      # you in a layer of your own, shown as drawn
+render.nativeBlocks=true     # GTA draws Minecraft's blocks itself, with its own camera
 ```
 
 - **commands**: GTA keeps its own clock and weather until Minecraft's change, by a command or anything else. GTA also
@@ -130,18 +135,19 @@ render.overscan=1.12         # 1.0..1.5: how much wider Minecraft's view is than
 
 ## Not done, and why
 
-- **Rebuilding blocks and entities as GTA geometry.** Minecraft's own renderer draws everything (blocks, Steve,
-  mobs), which is why they look exactly like Minecraft. GTA's props are only for collision.
+- **Rebuilding entities as GTA geometry.** Minecraft's own renderers draw everything (blocks through the native mesh,
+  Steve, mobs), which is why they look exactly like Minecraft. GTA's props are only for collision.
 - **Chunk-batched GTA collision.** Collision is one prop per solid block, at most 400, because GTA crashes at about
   1,500 script objects. Merging blocks into larger boxes would raise that limit; not done yet.
 - **Per-entity motion vectors.** Fast mobs and arrows would need Minecraft to export motion per pixel. Only Steve gets
   a correction.
 - **WebSocket schemas, heartbeats, authentication.** Messages are validated where they're parsed, and frames are
-  capped at 4 MB. There's no token: any local program can still connect.
+  capped at 4 MB. A handshake carrying an Origin header is refused (every browser sends one; native clients don't), so a
+  web page can no longer reach the link and run server commands. There's no token: a local program can still connect.
 
 ## Tests
 
-- **Dev client end-to-end:** `mc\gradlew.bat runClient`, then `powershell -File host\e2e_test.ps1`, a script playing GTA
+- **Dev client end-to-end:** `mc\gradlew.bat -p mc runClient`, then `powershell -File host\e2e_test.ps1`, a script playing GTA
   on the link. It types commands into chat, so only point it at the dev client. All steps passed on 2026-10-11. It
   covers:
   - the input path: T, typing, Enter, E, the mouse, Esc;
@@ -159,14 +165,18 @@ render.overscan=1.12         # 1.0..1.5: how much wider Minecraft's view is than
 - **Frames** (dev client): `host\frame_test.ps1 [-Rebuild]` spins and walks the camera while sections rebuild, and
   measures non-opaque block pixels, coverage drops and torn reads. 2026-10-11: 0.00% non-opaque in 736 frames; torn
   reads went from 4 of 259 to 0 of 257.
-- **Poses** (dev client): `host\pose_test.ps1` saves Minecraft's frame for each movement state to check by eye.
-- **Update and rollback:** `update_games.ps1` backs up, installs and verifies byte for byte.
-  `update_games.ps1 -SimulateFailure` checks the rollback: 2026-10-11, every file was identical to before.
+- **Poses** (dev client): `host\pose_test.ps1` saves Minecraft's frame for each movement state to check by eye, the
+  avatar layer separately.
+- **Stand-in GTA** (dev client only: it builds test blocks): `gta\tests\fakegta.exe <seconds> <shake 0|1> <third|orbit>
+  <screenshot prefix> [d3d12]` with ReShade (dxgi.dll) beside it. D3D12 runs Enhanced's path, GPU-shared frames
+  included. It binds its own depth buffer to DEPTH (disable ReShade's Generic Depth in its ReShade.ini) and draws thin
+  yellow outlines where the Minecraft test blocks are: native blocks must sit inside them through fast camera swings.
+  2026-10-12: both APIs, blocks locked; this test caught a DirectX 11 driver crash in the details pass (fixed).
+- **GPU frames** (dev client): `gta\tests\gpu_frames_test.exe <seconds> <5|3>` with `host\pose_test.ps1` playing the
+  host. 2026-10-12: PASS with 5 planes (933 of 933 avatar frames) and with 3 (none).
 
 ## Rollback
 
-- **Each update:** every update backs up what it replaces into `Documents\Universal\MCPassthrough-Backups\<time>\` (with
-  `update.log`), and puts it back by itself if the update fails.
 - **GTA:** the files replaced by the first install are in `gta\build\game_backup_20261010\`. `gta\install.ps1
   -Remove -Edition Enhanced` takes out everything the installer adds.
 - **Minecraft:** remove `passthrough-0.1.0.jar` from the profile's `mods` folder. `config\passthrough.properties` can
