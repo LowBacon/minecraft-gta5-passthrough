@@ -174,13 +174,9 @@ render.nativeBlocks=true     # GTA draws Minecraft's blocks itself, with its own
   2026-10-12: both APIs, blocks locked; this test caught a DirectX 11 driver crash in the details pass (fixed).
 - **GPU frames** (dev client): `gta\tests\gpu_frames_test.exe <seconds> <5|3>` with `host\pose_test.ps1` playing the
   host. 2026-10-12: PASS with 5 planes (933 of 933 avatar frames) and with 3 (none).
-- **Update and rollback:** `update_games.ps1` backs up, installs and verifies byte for byte.
-  `update_games.ps1 -SimulateFailure` checks the rollback: 2026-10-11, every file was identical to before.
 
 ## Rollback
 
-- **Each update:** every update backs up what it replaces into `Documents\Universal\MCPassthrough-Backups\<time>\` (with
-  `update.log`), and puts it back by itself if the update fails.
 - **GTA:** the files replaced by the first install are in `gta\build\game_backup_20261010\`. `gta\install.ps1
   -Remove -Edition Enhanced` takes out everything the installer adds.
 - **Minecraft:** remove `passthrough-0.1.0.jar` from the profile's `mods` folder. `config\passthrough.properties` can

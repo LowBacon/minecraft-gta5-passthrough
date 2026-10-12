@@ -27,7 +27,7 @@ other:
 - [Settings](#settings)
 - [Checking that it works](#checking-that-it-works)
 - [Troubleshooting](#troubleshooting)
-- [Updating, backups and removing](#updating-backups-and-removing)
+- [Updating and removing](#updating-and-removing)
 - [Safety and fair play](#safety-and-fair-play)
 - [Technical reference](#technical-reference)
 - [Project files](#project-files)
@@ -67,7 +67,7 @@ other:
 
 | Who | What |
 |---|---|
-| **LowBacon** | **Made this mod**: GTA V Enhanced support, creative flight and the elytra, the creative menu and the rest of Minecraft's controls, every hostile mob against GTA's people, the time and weather link, the shared GPU frames, your own layer, the native blocks, the fixes, the installer and the updater. |
+| **LowBacon** | **Made this mod**: GTA V Enhanced support, creative flight and the elytra, the creative menu and the rest of Minecraft's controls, every hostile mob against GTA's people, the time and weather link, the shared GPU frames, your own layer, the native blocks, the fixes and the installer. |
 | Rehan ([universal-modder](https://github.com/rehan-remade/universal-modder)) | The first passthrough this mod started from: the Fabric mod, the ScriptHookV script, the ReShade add-on and the effect (MIT). |
 | Adam Grzegorzewski ([EldenCraft](https://github.com/SocketByte/EldenCraft)) | The designs and code for the shared GPU frames, the avatar layer and the native blocks were adapted from EldenCraft, his Minecraft-in-Elden-Ring passthrough (MIT). |
 | Alexander Blade | [ScriptHookV](https://www.dev-c.com/gtav/scripthookv/) and its ASI loaders, which run scripts in GTA V. |
@@ -440,24 +440,12 @@ let `gta\fetch_deps.ps1` download them for you.
 
 ## Installing
 
-There are two ways:
-- **On your own PC**, use the ready folder `MCPassthrough-Mods`. `make_dist.ps1` builds it next to this project folder,
-  with everything inside.
-- **From scratch**, get each piece yourself (below).
+You need the mod's own files:
+- `passthrough-0.1.0.jar` for Minecraft;
+- `MCPassthrough.asi` and the effect `MCPassthrough.fx` for GTA.
 
-Either way, there are three steps: Minecraft, GTA V, GTA's settings.
-
-### What's in the MCPassthrough-Mods folder
-
-| Item | What it is |
-|---|---|
-| `1 - Minecraft mods folder\` | `passthrough-0.1.0.jar` (this mod) and the Fabric API jar |
-| `2 - GTA V Enhanced folder\` | everything that goes into GTA's game folder (`make_dist.ps1 -Edition Legacy` makes `2 - GTA V Legacy folder\` instead) |
-| `fabric-installer-<version>.jar` | Fabric's installer, for the official Minecraft launcher |
-| `READ ME FIRST.txt` | the short version of these steps |
-| `Update my games (close GTA and Minecraft first).bat` | puts the newest build into both games, with a backup (see [Updating](#updating-backups-and-removing)) |
-
-It contains ScriptHookV and ReShade, so it's only for your own games: don't share it or upload it.
+Build them from this repo (see [Building from source](#building-from-source)). They land in `mc\build\libs\`, `gta\build\`
+and `gta\shaders\`. Then there are three steps: Minecraft, GTA V, GTA's settings.
 
 ### Step 1: Minecraft
 
@@ -470,23 +458,33 @@ normal worlds should stay untouched.
 3. Add `passthrough-0.1.0.jar`. You can drag it onto the profile, or open the profile's folder and put it into `mods`.
 
 **With the official Minecraft Launcher:**
-1. Run `fabric-installer-<version>.jar` (double-click it; it needs Java). Choose **Client**, Minecraft **26.3**, loader
-   0.19.5 or newer, and press **Install**. It adds a `fabric-loader-...-26.3` installation to the launcher.
+1. Download Fabric's installer from [fabricmc.net](https://fabricmc.net/use/installer/) and run it (double-click it; it needs
+   Java). Choose **Client**, Minecraft **26.3**, loader 0.19.5 or newer, and press **Install**. It adds a
+   `fabric-loader-...-26.3` installation to the launcher.
 2. In the launcher, open **Installations**, edit that installation, and set its **Game directory** to a new empty folder,
    for example `C:\Games\MinecraftGTA`. If the installer couldn't add the installation (it can fail with the Microsoft
    Store launcher), add it yourself with that version.
-3. Put `passthrough-0.1.0.jar` and the Fabric API jar into `<that game directory>\mods`. Create the folder if it isn't
-   there.
+3. Put `passthrough-0.1.0.jar` and the Fabric API jar for 26.3 (from [Modrinth](https://modrinth.com/mod/fabric-api)) into
+   `<that game directory>\mods`. Create the folder if it isn't there.
 
 **Check it:** start that profile once. The game should open a world called "Passthrough" by itself, and Minecraft's log
 should say `host link listening on 127.0.0.1:25599`.
 
 ### Step 2: GTA V
 
-1. **Find GTA's folder.** In Steam, right-click GTA V Enhanced, then Manage, then Browse local files. It's the folder with
-   `GTA5_Enhanced.exe` (`GTA5.exe` for Legacy).
-2. **Copy the files.** With the ready folder, copy everything in `2 - GTA V Enhanced folder` into GTA's folder, and keep the
-   `reshade-shaders` folder as it is. If GTA already has a `ReShade.ini` you like, you can skip that one file.
+Close GTA first. Then let the installer put the files in, or copy them by hand.
+
+**With the installer**, from PowerShell in this folder:
+
+```powershell
+gta\fetch_deps.ps1                  # once: downloads ScriptHookV and ReShade 6.8.0 (the add-on build)
+gta\install.ps1 -Edition Enhanced   # or -Edition Legacy
+```
+
+- **What it does.** `install.ps1` finds GTA in your Steam libraries (or pass `-GtaDir <folder>`) and copies in every file in
+  the table below. A `ReShade.ini` that's already there is kept.
+- **What it won't do.** It refuses to replace a loader, ReShade or `args.txt` that another mod put there (`-Force`
+  overrides). It also keeps no copies of what it replaces, so back up anything you want to keep first.
 
 These are the files and what each one does:
 
@@ -502,18 +500,42 @@ These are the files and what each one does:
 | `reshade-shaders\Shaders\MCPassthrough.fx` | yes | yes | the effect |
 | `reshade-shaders\Shaders\ReShade.fxh`, `ReShadeUI.fxh` | yes | yes | ReShade's headers, which the effect includes |
 
-**From scratch, without the ready folder:**
-1. **ScriptHookV:** from [dev-c.com](https://www.dev-c.com/gtav/scripthookv/), copy `ScriptHookV.dll` and the ASI loader for
+**By hand:**
+1. **Find GTA's folder.** In Steam, right-click GTA V Enhanced, then Manage, then Browse local files. It's the folder with
+   `GTA5_Enhanced.exe` (`GTA5.exe` for Legacy).
+2. **ScriptHookV:** from [dev-c.com](https://www.dev-c.com/gtav/scripthookv/), copy `ScriptHookV.dll` and the ASI loader for
    your edition into GTA's folder.
-2. **ReShade:** download **ReShade 6.8.0 with full add-on support** from [reshade.me](https://reshade.me).
+3. **ReShade:** download **ReShade 6.8.0 with full add-on support** from [reshade.me](https://reshade.me).
    - **Enhanced:** run its setup, pick `GTA5_Enhanced.exe` and DirectX 12. It installs `dxgi.dll`.
    - **Legacy:** take `ReShade64.dll` out of the setup (it's a zip) and put it into GTA's folder as `ReShade64.asi`.
-3. **This mod's files:** put `MCPassthrough.asi` into GTA's folder, and `MCPassthrough.fx`, `ReShade.fxh` and
-   `ReShadeUI.fxh` into `reshade-shaders\Shaders`.
-4. **The settings files:** write `args.txt`, `ReShade.ini` and `ReShadePreset.ini` the way `gta\install.ps1` does.
-5. **The easy way:** run `gta\install.ps1 -Edition Enhanced` from this repo, which does all of it. It finds GTA in your Steam
-   libraries, and it refuses to replace a loader, ReShade or `args.txt` that some other mod put there (`-Force`
-   overrides).
+4. **This mod's files:**
+   - `MCPassthrough.asi` goes into GTA's folder.
+   - `MCPassthrough.fx` (from `gta\shaders\`) goes into `reshade-shaders\Shaders`.
+   - So do `ReShade.fxh` and `ReShadeUI.fxh`. They're in `gta\third_party\` after `fetch_deps`, or in
+     [crosire/reshade-shaders](https://github.com/crosire/reshade-shaders).
+5. **The settings files**, in GTA's folder:
+   - `args.txt`, one line: `-nobattleye -noBE`
+   - `ReShadePreset.ini`:
+     ```ini
+     Techniques=MCPassthrough@MCPassthrough.fx
+     TechniqueSorting=MCPassthrough@MCPassthrough.fx
+     ```
+   - `ReShade.ini`, if you don't have one already (if you do, make sure its `[GENERAL]` section has these lines):
+     ```ini
+     [GENERAL]
+     EffectSearchPaths=.\reshade-shaders\Shaders\
+     TextureSearchPaths=.\reshade-shaders\Textures\
+     PresetPath=.\ReShadePreset.ini
+     PreprocessorDefinitions=RESHADE_DEPTH_INPUT_IS_REVERSED=1,RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN=0,RESHADE_DEPTH_INPUT_IS_LOGARITHMIC=0,RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=1000
+
+     [OVERLAY]
+     TutorialProgress=4
+     ShowClock=0
+     ShowFPS=0
+
+     [SCREENSHOT]
+     SavePath=.\
+     ```
 
 **Other mods:**
 - In Enhanced, a leftover `dinput8.dll` does nothing (Enhanced's loader is `xinput1_4.dll`).
@@ -704,20 +726,18 @@ copy**.
 | GTA closed when it tried to go online | That's ScriptHookV protecting you: modded GTA is story mode only. |
 | A Minecraft key seems stuck | Press it again, or Esc. Keys are released when GTA disconnects. |
 | The Passthrough world is cluttered | It's `saves\passthrough` in the profile. Delete it (with Minecraft closed) to start fresh. |
-| "Update my games" says STOP | Close both games first: Windows locks their files while they run. |
+| A file can't be replaced while updating | Close both games first: Windows locks their files while they run. |
 
-## Updating, backups and removing
+## Updating and removing
 
 ### Updating
 
-After a new build, close both games and run **`Update my games (close GTA and Minecraft first).bat`**, or
-`update_games.ps1 -Edition Enhanced` (`-McMods <profile>\mods` picks another Minecraft profile). Step by step:
-1. It stops if GTA or Minecraft is running.
-2. It finds the Minecraft profile: by default the Modrinth App profile "Gta", else the first profile with a passthrough jar.
-3. It backs up every file it will replace into `..\MCPassthrough-Backups\<date and time>\`, with an `update.log`.
-4. It installs the new jar and the GTA files.
-5. It checks every installed file byte for byte against the build.
-6. If anything fails, it puts the backup back by itself.
+After a new build, close both games, then:
+1. **Minecraft:** replace `passthrough-0.1.0.jar` in the profile's `mods` folder with the new one from `mc\build\libs\`.
+2. **GTA:** run `gta\install.ps1 -Edition Enhanced` again. It copies the new `MCPassthrough.asi` and `MCPassthrough.fx` over
+   the old ones, and keeps your `ReShade.ini`.
+
+Copy the old files somewhere first if you want to be able to go back.
 
 ### Removing
 
@@ -740,10 +760,8 @@ After a new build, close both games and run **`Update my games (close GTA and Mi
 - **Pick Story Mode by hand.** Nothing in this project clicks GTA's landing page for you, on purpose. Once, during
   development, keystrokes meant for another window landed in GTA's landing page, and GTA showed "attempting to access GTA
   Online servers with an altered version". ScriptHookV blocked it, but don't risk it.
-- **The game folder.**
-  - The installer only adds its own files, refuses to replace another mod's loader or ReShade, and can remove exactly what
-    it added.
-  - The updater backs up first and rolls back on failure.
+- **The game folder.** The installer only adds its own files, refuses to replace another mod's loader or ReShade, and can
+  remove exactly what it added.
 - **The link.**
   - It listens on 127.0.0.1:25599 only, so nothing outside your PC can reach it.
   - It refuses web pages: browsers can open WebSockets to 127.0.0.1, so any connection a browser makes is turned away.
@@ -868,12 +886,8 @@ reads again, so nobody ever uses half a frame or half a mesh. A mutex stops two 
 | `gta/fetch_deps.ps1`, `build.bat`, `install.ps1` | download ScriptHookV and ReShade (into `gta/third_party/`, never committed), build with MSVC, install into GTA |
 | `gta/tests/` | test hosts: `fakegta.cpp` (a GTA stand-in, DirectX 11 or 12), `gpu_frames_test.cpp`, `ws_test.cpp`, and `build_fakegta.bat` |
 | `host/` | tests against the dev client: `e2e_test.ps1`, `frame_test.ps1`, `pose_test.ps1` |
-| `update_games.ps1` | puts the newest build into both games, with backup, verification and rollback |
-| `make_dist.ps1` | makes the `MCPassthrough-Mods` folder |
 | `FEATURES.md` | the status of every feature, and how each was checked |
-| `MODLOG.md` | the development journal |
 | `THIRD_PARTY_NOTICES.md`, `LICENSE` | the licences |
-| `AGENTS.md`, `CLAUDE.md` | rules for AI coding agents working on this repo |
 
 ## Building from source
 
@@ -884,12 +898,13 @@ You need:
 From PowerShell, in this folder:
 
 ```powershell
-mc\gradlew.bat -p mc build              # the mod: mc\build\libs\passthrough-0.1.0.jar
-gta\fetch_deps.ps1                # once: ScriptHookV's SDK and runtime, ReShade 6.8.0 and its headers
-gta\build.bat                     # gta\build\MCPassthrough.asi
-.\update_games.ps1 -Edition Enhanced   # install into both games (close them first)
-.\make_dist.ps1                   # or: the ready-to-copy folder ..\MCPassthrough-Mods
+mc\gradlew.bat -p mc build          # the mod: mc\build\libs\passthrough-0.1.0.jar
+gta\fetch_deps.ps1                  # once: ScriptHookV's SDK and runtime, ReShade 6.8.0 and its headers
+gta\build.bat                       # gta\build\MCPassthrough.asi
+gta\install.ps1 -Edition Enhanced   # the GTA side into GTA (close it first)
 ```
+
+Then put `mc\build\libs\passthrough-0.1.0.jar` into your Minecraft profile's `mods` folder (see [Installing](#installing)).
 
 - If Gradle fails with "Unable to establish loopback connection", set
   `$env:JAVA_TOOL_OPTIONS = '-Djdk.net.unixdomain.tmpdir=C:\jdkaf'` (any short folder off a drive root) and run it again.
