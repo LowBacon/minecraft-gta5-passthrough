@@ -2,11 +2,19 @@
 	"schemaVersion": 1,
 	"id": "passthrough",
 	"version": "${version}",
-	"name": "Passthrough",
-	"description": "Runs alongside another game: its camera drives Minecraft's, its collision becomes invisible blocks, and Minecraft's picture (colour + depth) is handed back to be composited into the host game.",
+	"name": "Minecraft x GTA V Passthrough",
+	"description": "Play real Minecraft inside GTA V story mode: GTA's camera drives Minecraft's, GTA's ground becomes invisible blocks, and Minecraft is drawn into GTA's picture (blocks drawn by GTA itself), with what you do in one game happening in the other. Made by LowBacon.",
 	"authors": [
-		"rehan"
+		"LowBacon"
 	],
+	"contributors": [
+		"Rehan (the original passthrough, universal-modder)",
+		"Adam Grzegorzewski (EldenCraft: GPU frames, avatar layer, native blocks)"
+	],
+	"contact": {
+		"homepage": "https://github.com/LowBacon/minecraft-gta5-passthrough",
+		"sources": "https://github.com/LowBacon/minecraft-gta5-passthrough"
+	},
 	"license": "MIT",
 	"environment": "*",
 	"entrypoints": {

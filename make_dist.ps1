@@ -1,7 +1,7 @@
 # Put everything for one machine in one folder, ready to copy into the games: the Minecraft mod (+ Fabric API and
 # Fabric's installer) and the GTA V files (MCPassthrough.asi, ScriptHookV, its ASI loader, ReShade and the effect).
 #   .\make_dist.ps1 [-Out <folder>] [-Edition Enhanced|Legacy]
-# Build first: mc\gradlew.bat build (JDK 25), gta\fetch_deps.ps1, gta\build.bat. The folder holds ScriptHookV and
+# Build first: mc\gradlew.bat -p mc build (JDK 25), gta\fetch_deps.ps1, gta\build.bat. The folder holds ScriptHookV and
 # ReShade, which may not be redistributed: it's for your own games, not for sharing or committing (it's made outside
 # the repo by default).
 param([string]$Out = (Join-Path (Split-Path $PSScriptRoot -Parent) 'MCPassthrough-Mods'),
@@ -53,8 +53,9 @@ Copy-Item (Join-Path $rt 'ReShade64.dll') (Join-Path $gta $e.ReShade)
 Copy-Item (Join-Path $here 'gta\shaders\MCPassthrough.fx'), (Join-Path $here 'gta\third_party\ReShade.fxh'), (Join-Path $here 'gta\third_party\ReShadeUI.fxh') $shaders
 
 $readme = @"
-MINECRAFT x GTA V PASSTHROUGH: what goes where
-===============================================
+MINECRAFT x GTA V PASSTHROUGH by LowBacon: what goes where
+==========================================================
+(How it all works, every setting and troubleshooting: README.md in the mod's project folder.)
 
 1) MINECRAFT (Java Edition $($props.minecraft_version), Fabric)
    a. Run $installer (double-click; needs Java). Pick Minecraft $($props.minecraft_version), Fabric Loader $($props.loader_version)
@@ -99,6 +100,7 @@ MINECRAFT x GTA V PASSTHROUGH: what goes where
    args.txt, ReShade.ini, ReShadePreset.ini and reshade-shaders\Shaders\MCPassthrough.fx; from the mods folder the
    two jars.
 
+The mod is by LowBacon, with code adapted from Rehan's universal-modder and Adam Grzegorzewski's EldenCraft (MIT).
 ScriptHookV (c) Alexander Blade, dev-c.com. ReShade by crosire, reshade.me. Fabric, fabricmc.net. These are for your
 own copy of the games; don't re-upload this folder.
 "@

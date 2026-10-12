@@ -183,3 +183,74 @@ on the head").
       tests' blocks buried the player.
 - **Still not ported (Phase B):** EldenCraft's native block meshes. Blocks are still re-projected RGB-D, so GTA can
   show for a frame where a turn uncovers what Minecraft didn't draw.
+
+**2026-10-12, Phase B: native blocks (EldenCraft's design, ported), and three bugs** (user: "make like 1:1 so its works
+prefectly also fixs any bugs you find").
+- **Ported (MIT, credited in THIRD_PARTY_NOTICES.md):**
+  - Minecraft side: BlockMeshClient (vanilla ModelBlockRenderer/FluidRenderer into one mesh, rebuilt per changed
+    section in 2 ms a frame), the mailbox/handoff/changes/coverage/payload classes, the animated sprites, BlockDetails
+    (cracks and the outline), and the mixins (chunk suppression, dirty tracking, frame begin, light, live blocks,
+    details).
+  - The exported frame names the mesh revision it left out: MCPT header 2048 + 64 * slot ("MCSC").
+  - GTA side: gta/src/blocks/ (protocol, mapping readers, ack writer, shader, translucent sort, renderer). It draws
+    with the presented GTA pose (the same lag as the re-projection) and tests against GTA's depth with the effect's
+    calibration (HostReversedZ, HostDepthScale, DepthBias).
+  - The effect composites three layers, nearest first: native blocks, the re-projected world (now entities only), and
+    the avatar.
+  - The script sends {"t":"host","pid":n} on connect.
+  - New option render.nativeBlocks (true).
+- **Bugs found and fixed:**
+  1. ReShade 6.8's update_texture_bindings waits for the GPU to go idle, and the add-on rebound its five layers on every
+     Minecraft frame, stalling GTA each time. Now one bound set gets GPU copies of each whole frame: from the shared
+     set, from D3D11 staging textures, or from a D3D12 upload ring (no synchronous upload).
+  2. Security: any web page could open ws://127.0.0.1:25599 and run op commands. Handshakes with an Origin header are
+     now refused.
+  3. The DirectX 11 driver crashed on a partial UpdateSubresource of the details' vertex buffer, every frame. Now it's
+     a dynamic buffer written with discard. This was found by bisecting the stand-in.
+- **Also:**
+  - BlockMeshMailbox reads GetLastError through captured call state; EldenCraft's separate GetLastError call from Java
+    could read a stale value.
+  - The idle "waiting" log line is quiet while no host is attached.
+- **Test host:**
+  - fakegta has a D3D12 mode: Enhanced's path, GPU-shared frames included. Both modes bind their own depth to DEPTH
+    (ReShade's generic depth never picked the stand-in's up, so occlusion against "GTA" had never actually been tested
+    there).
+- **Results (dev client; GTA and Modrinth Minecraft closed):**
+  - Native blocks draw on both APIs and stay inside the stand-in's own block outlines through fast camera swings.
+  - pose_test: every pose has the avatar layer.
+  - frame_test: 0.00% non-opaque.
+  - gpu_frames_test: PASS with 5 planes and with 3.
+  - No errors in either log.
+- **Not tested in real GTA yet.** On Enhanced, F10 should say "GPU shared, avatar layer, native blocks". If the blocks
+  swim while turning, F9 picks the pose lag (Enhanced starts at 1).
+
+**2026-10-12 16:00, README rewritten, LowBacon credited, unneeded files out** (user: "redo the Readme.md ... who made this
+and it should be LowBacon ... how to enable this mod and how to add this with full instruction"; "delete all unnecessary
+files that the mod doesnt need").
+- **README.md, rewritten:**
+  - what the mod does, who made it, why it's possible, and how it works step by step;
+  - install steps for the Modrinth App and the official launcher, and a GTA file table for Enhanced and Legacy;
+  - every setting (config, `-D` options, the ReShade effect), the F10 overlay and debug views, and troubleshooting;
+  - updating and removing, safety, the link messages, the shared memory, and every mixin.
+- **Authorship:**
+  - fabric.mod.json: name "Minecraft x GTA V Passthrough", authors LowBacon, contributors Rehan and Adam Grzegorzewski,
+    and the GitHub links;
+  - the ReShade add-on exports NAME/DESCRIPTION (shown in ReShade's Add-ons tab);
+  - THIRD_PARTY_NOTICES.md gained universal-modder's MIT notice (the passthrough started as its example), next to
+    EldenCraft's.
+- **Moved out** to `..\MCPassthrough-Backups\2026-10-12_16-06-55_removed-from-project\` (347 files, 32 MB), not deleted:
+  - the toolkit: `.agents`, `.claude`, `.claude-plugin`, `skills`, `knowledge`, `plugins`, `state` (empty), and the
+    toolkit's AGENTS.md/CLAUDE.md;
+  - the video pipeline (`video/`), and the WSL scripts (`gradle.sh`, `gta/*.sh`): no WSL or Python on this PC;
+  - the Python host tools (superseded by the PowerShell and C++ tests);
+  - the test output PNGs and the build intermediates.
+- **Also:**
+  - New short AGENTS.md (the rules for this mod) and CLAUDE.md (`@AGENTS.md`). The old `.claude/settings.json` hook
+    pointed at a missing script.
+  - `build.bat` and `build_fakegta.bat` delete their intermediates after a successful build.
+  - A root .gitignore keeps the test output out of git.
+  - The docs say `mc\gradlew.bat -p mc ...`, which works from the repo root.
+- **Rebuilt both halves, and installed:** update_games UPDATE OK (backup `MCPassthrough-Backups\2026-10-12_16-19-05`);
+  make_dist refreshed `MCPassthrough-Mods`.
+- **Left alone in GTA's folder:** the user's own NativeTrainer.asi and OpenRPF.asi, ReShade's stock shaders, and an unused
+  `dinput8.dll` (Legacy's loader; Enhanced loads `xinput1_4.dll`).
